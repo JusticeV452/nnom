@@ -24,12 +24,13 @@ import io
 import time
 import warnings
 import scipy.stats
+from typing import List
 
 import numpy as np
 import tensorflow as tf
+import tensorflow.keras as keras
 import matplotlib.pyplot as plt
 
-import tensorflow.keras as keras
 from tensorflow.keras import layers as kl
 from tensorflow.keras.models import Model
 from sklearn import metrics
@@ -52,6 +53,26 @@ def is_input_layer(layer: kl.Layer):
 
     """
     return "input" in layer.name
+    
+    
+def get_input_list(model: keras.Model | kl.Layer):
+    """
+    Return list of model/layer's inputs
+
+    Parameters
+    ----------
+    model : keras.Model | kl.Layer
+
+    Returns
+    -------
+    inputs : list
+        List of keras_tensors.
+
+    """
+    inputs = model.input
+    if not isinstance(inputs, list):
+        inputs = [inputs]
+    return inputs
 
 
 def get_int_bits(min_value: float, max_value: float):
@@ -109,8 +130,8 @@ def dec_bits_by_kld(layer: kl.Layer, features, dec_bits: int, verbose: bool=Fals
     bins = np.arange(-abs_max, abs_max, abs_max / 2048 * 2)
     q_bins = np.arange(-abs_max, abs_max, abs_max / 256 * 2)
     flat_hist = np.histogram(features.flatten(), bins=bins)[0]
-    kl_loss = []
-    kl_shifts = []
+    kld_loss = []
+    kld_shifts = []
     for shift in range(4):
         t = 2 ** (dec_bits + shift)     # 2-based threshold
         act = np.round(features.flatten() * t)
@@ -131,16 +152,16 @@ def dec_bits_by_kld(layer: kl.Layer, features, dec_bits: int, verbose: bool=Fals
                 )
         flat_hist[flat_hist == 0] = small_var
         act_hist[act_hist == 0] = small_var
-        kl = scipy.stats.entropy(flat_hist, act_hist)
-        kl_loss.append(kl)
-        kl_shifts.append(dec_bits + shift)
+        kld = scipy.stats.entropy(flat_hist, act_hist)
+        kld_loss.append(kld)
+        kld_shifts.append(dec_bits + shift)
 
     # set the dec_bit to the KLD results
-    new_dec = kl_shifts[np.argmin(kl_loss)]
+    new_dec = kld_shifts[np.argmin(kld_loss)]
 
     if verbose:
-        print("KLD loss:", kl_loss)
-        print("KLD shift:", kl_shifts)
+        print("KLD loss:", kld_loss)
+        print("KLD shift:", kld_shifts)
     if verbose and dec_bits != new_dec:
         print(layer.name, "is using KLD method, original shift:", dec_bits, "KLD results:", new_dec)
 
