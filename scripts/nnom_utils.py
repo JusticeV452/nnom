@@ -19,15 +19,176 @@
     Currently, this script does not support RNN (type) layers.
 '''
 
-import matplotlib.pyplot as plt
-import tensorflow as tf
-from tensorflow.keras.layers import InputLayer
-from tensorflow.keras.models import Model
-
-from sklearn import metrics
-from .fully_connected_opt_weight_generation import *
+import os
+import io
 import time
 import warnings
+import scipy.stats
+
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+import tensorflow.keras as keras
+from tensorflow.keras import layers as kl
+from tensorflow.keras.models import Model
+from sklearn import metrics
+
+from .fully_connected_opt_weight_generation import *
+from utils import is_input_layer
+
+def get_int_bits(min_value: float, max_value: float):
+    """
+    Determine the number of bits needed to represent a set of values
+
+    Parameters
+    ----------
+    min_value : float
+        The smallest value in a set of values.
+    max_value : float
+        The largest value in a set of values.
+
+    Returns
+    -------
+    int
+        The number of bits needed to represent a set of values with a minimum
+        of `min_value` and maxmum of `max_value`.
+
+    """
+    return int(np.ceil(np.log2(max([abs(min_value), abs(max_value), 1e-10]))))
+
+
+def pad_filter_sizes(*filter_sizes, pad_val=1, shape=2):
+    padded_sizes = []
+    for f_size in filter_sizes:
+        if type(f_size) is int:
+            f_size = [f_size]
+        padded_sizes.append(
+            # Extend shape with pad_val if len(f_size) < shape
+            (*(pad_val,) * (shape - len(f_size)), *f_size) if len(f_size) < shape else tuple(f_size)
+        )
+    return padded_sizes
+
+
+def flatten(L):
+    if not isinstance(L, list | tuple):
+        return [L]
+    return sum([flatten(el) for el in L], start=[])
+
+
+def to_transposed_x4_q7_weights(weights: np.array):
+    transposed_wts = np.transpose(weights)
+    return convert_to_x4_q7_weights(np.reshape(
+        transposed_wts,
+        (transposed_wts.shape[0], transposed_wts.shape[1], 1, 1)
+    ))
+
+
+def dec_bits_by_kld(layer: kl.Layer, features, dec_bits: int, verbose: bool=False):
+    max_val = features.max()
+    min_val = features.min()
+    abs_max = max(abs(max_val), abs(min_val))
+    small_var = 1e-5
+    bins = np.arange(-abs_max, abs_max, abs_max / 2048 * 2)
+    q_bins = np.arange(-abs_max, abs_max, abs_max / 256 * 2)
+    flat_hist = np.histogram(features.flatten(), bins=bins)[0]
+    kl_loss = []
+    kl_shifts = []
+    for shift in range(4):
+        t = 2 ** (dec_bits + shift)     # 2-based threshold
+        act = np.round(features.flatten() * t)
+        act = act / t
+        act = np.clip(act, -128 / t, 127 / t)
+        act = np.histogram(act, bins=q_bins)[0]
+        act_hist = np.zeros(2047)
+        chunk = int(2048 / 256)
+        for i in range(int(255)):
+            none_zero = np.count_nonzero(flat_hist[i * chunk:(i + 1) * chunk])
+            if none_zero == 0:
+                continue
+            for j in range(chunk):
+                act_hist[i * chunk + j] = (
+                    act[i] / none_zero
+                    if flat_hist[i * chunk + j] != 0
+                    else 0
+                )
+        flat_hist[flat_hist == 0] = small_var
+        act_hist[act_hist == 0] = small_var
+        kl = scipy.stats.entropy(flat_hist, act_hist)
+        kl_loss.append(kl)
+        kl_shifts.append(dec_bits + shift)
+
+    # set the dec_bit to the KLD results
+    new_dec = kl_shifts[np.argmin(kl_loss)]
+
+    if verbose:
+        print("KLD loss:", kl_loss)
+        print("KLD shift:", kl_shifts)
+    if verbose and dec_bits != new_dec:
+        print(layer.name, "is using KLD method, original shift:", dec_bits, "KLD results:", new_dec)
+
+    dec_bits = new_dec
+    return dec_bits
+
+
+def make_initial_shift_list(
+        model: keras.Model, x_test: np.array,
+        quantize_method: str="max_min", verbose: bool=False):
+    shift_list = {}
+    last_layer = None
+    
+    def get_features(model, inp):
+        if verbose:
+            return model.predict(inp)
+        return model(inp).numpy()
+
+    # FIXME: only support one input
+    model_layers = model.layers
+    if not is_input_layer(model.layers[0]):
+        model_layers = [model.input] + model_layers
+
+    for layer in model_layers: # layer loop
+        if is_input_layer(layer):
+            features = x_test
+        # batch_normalization will need to be handled differently, since we are fusing the weight to its predecessor.
+        # sigmoid and tanh are different, their shift is fixed to 7
+        elif is_shift_layer(layer) or "batch_normalization" in layer.name:
+            layer_model = Model(inputs=model.input, outputs=layer.output)
+            features = get_features(layer_model, x_test)
+        # Otherwise leave the features not changed, so this layer shift will be the same
+        # as its inputs
+        
+        #  calculate no saturation shift
+        max_val = features.max()
+        min_val = features.min()
+        int_bits = get_int_bits(min_val, max_val)
+        dec_bits = 7 - int_bits
+
+        # saturation shift, using KLD method
+        # Ref: http://on-demand.gputechconf.com/gtc/2017/presentation/s7310-8-bit-inference-with-tensorrt.pdf
+        if (
+            "kld" in quantize_method
+            and not is_shift_fixed(layer)
+            and not is_input_layer(layer)
+            and "dense" not in layer.name
+        ): # test, also do not use kld in input layer
+            dec_bits = dec_bits_by_kld(layer, features, dec_bits, verbose=verbose)
+
+        if verbose:
+            print(layer.name, "max value:", max_val, "min value:", min_val, "dec bit:", dec_bits)
+        
+        # record the shift
+        shift_name = layer.name
+        if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
+            shift_name = shift_name.split(':')[0]
+        shift_list[shift_name] = dec_bits
+
+        if "batch_normalization" in layer.name:
+            # use the bn layer shift to update the last layer.
+            shift_list[last_layer.name] = dec_bits
+        last_layer = layer
+    return shift_list
+
 
 """ 
 this is the generate the test set data to a bin file
@@ -82,6 +243,7 @@ def generate_test_bin(x, y, name='test_data_with_label.bin'):
     print("test data length:", test_label.size)
     return
 
+
 def is_shift_layer(layer):
     ''' layer which can change the output encoding'''
     #FIXME: add more which will change the output shift
@@ -102,6 +264,7 @@ def is_shift_layer(layer):
         return True
     return False
 
+
 def is_shift_fixed(layer):
     ''' layer which shift to a fixed value'''
     #FIXME: add more which will change the output shift
@@ -113,7 +276,8 @@ def is_shift_fixed(layer):
         ('activation' in layer.name and layer.get_config()['activation'] == 'tanh')
     ):
         return True
-    return  False
+    return False
+
 
 def fuse_bn_to_conv(layer):
     # try to fuse BN layer to convolutional
@@ -172,545 +336,449 @@ def fuse_bn_to_conv(layer):
         # after that, the model will be destroyed.. need a better way to pass the new weight
         layer.set_weights([c_w, c_b])
 
-def generate_weights(model, name='weights.h', format='hwc', shift_list=None):
-    # Quantize weights to 8-bits using (min,max) and write to file
-    f = open(name, 'w')
-    f.write('#include "nnom.h"\n\n')
-    f.close()
 
-    for curr_idx, layer in  enumerate(model.layers):
-        if (not layer.weights):
+def generate_weights(
+        model: keras.Model, x_test: np.array=None, quantize_method="max_min",
+        calibrate_size=1000, format="hwc", verbose=False):
+    # Quantize weights to 8-bits using (min,max) and write to file
+    f = io.StringIO()
+    f.write('#include "nnom.h"\n\n')
+
+    if type(x_test) is type(None):
+        shift_list = None
+    else:
+        shift_list = layers_output_ranges(
+            model, x_test, quantize_method=quantize_method,
+            calibrate_size=calibrate_size, verbose=verbose
+        )
+
+    layer_quantize_info = {}
+    layer_weights = {}
+    for layer in model.layers:
+        if not layer.weights:
             continue
 
         # before merging bn layer, check if the bn is "legally" after Conv
-        if('batch_normalization' in layer.name) and \
-            ('conv' not in layer.inbound_nodes[0].inbound_layers.name):
-            raise  Exception('Currently only support batch_normalization after conv', layer.name,
-                            layer._inbound_nodes[0].inbound_layers[0].name)
+        if (
+            "batch_normalization" in layer.name
+            and "conv" not in layer.inbound_nodes[0].inbound_layers.name
+        ):
+            raise Exception(
+                "Currently only support batch_normalization after conv",
+                layer.name, layer._inbound_nodes[0].inbound_layers[0].name
+            )
 
         # try to fuse BN layer to convolutional
-        if ('conv' in layer.name) and \
-            ('batch_normalization' in layer.outbound_nodes[0].outbound_layer.name):
+        if (
+            "conv" in layer.name
+            and layer.outbound_nodes
+            and "batch_normalization" in layer.outbound_nodes[0].outbound_layer.name
+        ):
             fuse_bn_to_conv(layer)
 
         # generate weights and bias now
         weight_dec_shift = 0
-        print('weights for layer', layer.name)
+        if verbose:
+            print('weights for layer', layer.name)
+
+        layer_quantize_info[layer.name] = {}
+        layer_weights[layer.name] = {}
         for var in layer.weights:
             var_name = str(var.name)
-            if("kernel" in var_name ):
-                var_values = layer.get_weights()[0] # weight
-                print("  weight:", var_name)
-            elif("bias" in var_name):
-                var_values = layer.get_weights()[1] # bias
-                print("  bias: ",var_name)
-            else:
+            is_kernel = "kernel" in var_name
+            if not is_kernel and "bias" not in var_name:
                 continue
 
-            print("  original shape: ", var_values.shape)
+            var_values = var.numpy()
             min_value = np.min(var_values)
             max_value = np.max(var_values)
 
-            int_bits = int(np.ceil(np.log2(max(abs(min_value), abs(max_value)))))
+            int_bits = get_int_bits(min_value, max_value)
             dec_bits = 7 - int_bits
-            print("  dec bit", dec_bits)
+
+            if verbose:
+                print(f" {'weight' if is_kernel else 'bias'}:", var_name)
+                print("  original shape: ", var_values.shape)
+                print("  dec bit", dec_bits)
+
             bSameAsKernel = False
-            if(is_shift_layer(layer)):
-                bSameAsKernel = False
-                inp = layer.input.name.replace(':','/').split('/')[0]
+            if is_shift_layer(layer):
+                assert shift_list, f"Layer {layer.name} is classified as a shift layer so shift_list is required."
+                inp = layer.input.name.replace(':', '/').split('/')[0]
                 input_encoding = shift_list[inp]
-                if ("kernel" in var_name):
+                if is_kernel:
                     weight_dec_shift = dec_bits
                 else:
-                    shift = input_encoding+weight_dec_shift-dec_bits
-                    if(shift < 0):
+                    shift = input_encoding + weight_dec_shift - dec_bits
+                    if shift < 0:
                         bSameAsKernel = True
-            if(shift_list is None or bSameAsKernel):
-                # check if bias shift > weight shift, then reduce bias shift to weight shift	
-                if ("kernel" in var_name):
-                    weight_dec_shift = dec_bits	
-                else:	
-                    if(dec_bits > weight_dec_shift):	
-                        dec_bits = weight_dec_shift	
-                print("  new dec bit", dec_bits)
+
+            if shift_list is None or bSameAsKernel:
+                # check if bias shift > weight shift, then reduce bias shift to weight shift
+                if is_kernel:
+                    weight_dec_shift = dec_bits
+                elif dec_bits > weight_dec_shift:
+                    dec_bits = weight_dec_shift
+                if verbose:
+                    print("  new dec bit", dec_bits)
+
+            layer_quantize_info[layer.name][var_name] = {
+                "min": min_value,
+                "max": max_value,
+                "data_width": dec_bits
+            }
 
             # convert to [-128,128) or int8
             var_values = np.round(var_values * 2 ** dec_bits)
-            var_name = var_name.replace('/', '_')
-            var_name = var_name.replace(':', '_')
-            with open(name, 'a') as f:
-                f.write('#define ' + var_name.upper() + ' {')
+            layer_weights[layer.name][int(not is_kernel)] = var_values
+            var_name = var_name.replace('/', '_').replace(':', '_')
+            f.write("#define " + var_name.upper() + " {")
+
             # CHW format
-            if ('chw' in format):
-                if "dense" in var_name and "kernel" in var_name:
-                    transposed_wts = np.transpose(var_values)
-                    transposed_wts = convert_to_x4_q7_weights(
-                        np.reshape(transposed_wts, (transposed_wts.shape[0], transposed_wts.shape[1], 1, 1)))
+            if "chw" in format:
+                if is_kernel and "dense" in var_name:
+                    transposed_wts = to_transposed_x4_q7_weights(var_values)
                 # all other kernels, bias stay the same
                 else:
                     transposed_wts = var_values
             # HWC format
             else:
-                if (len(var_values.shape) == 3):  # 1D convolution layer weights
+                if len(var_values.shape) == 3:  # 1D convolution layer weights
                     transposed_wts = np.transpose(var_values, (2, 0, 1))
-                elif (len(var_values.shape) == 4):  # 2D convolution layer weights
+                elif len(var_values.shape) == 4:  # 2D convolution layer weights
                     transposed_wts = np.transpose(var_values, (3, 0, 1, 2))
-                else:  # fully connected layer weights or biases of any layer
+                elif is_kernel and "dense" in var_name:
+                    # fully connected layer weights or biases of any layer
                     # test, use opt weight reorder
-                    if "dense" in var_name and "kernel" in var_name:
-                        transposed_wts = np.transpose(var_values)
-                        transposed_wts = convert_to_x4_q7_weights(np.reshape(transposed_wts ,(transposed_wts.shape[0], transposed_wts.shape[1], 1, 1)))
-                    else:
-                        transposed_wts = np.transpose(var_values)
+                    transposed_wts = to_transposed_x4_q7_weights(var_values)
+                else:
+                    transposed_wts = np.transpose(var_values)
+            if verbose:
+                print("  reshape to:", transposed_wts.shape)
 
-            print("  reshape to:",transposed_wts.shape)
+            f.write(np.array2string(
+                transposed_wts.flatten(),
+                separator=", ",
+                threshold=transposed_wts.size,
+                formatter={"all": lambda x: str(int(x))}
+            ).strip("[]").replace('\n', ''))
+            # transposed_wts.tofile(f, sep=", ", format="%d")
+            f.write("}\n\n")
+            f.write(f"#define {var_name.upper()}_SHIFT ({dec_bits})\n\n")
+            if not is_kernel:
+                f.write("\n")
+    return f, layer_weights, layer_quantize_info, shift_list
 
-            with open(name, 'a') as f:
-                transposed_wts.tofile(f, sep=", ", format="%d")
-                f.write('}\n\n')
-                if ("bias" in var_name):
-                    f.write('#define ' + var_name.upper() + '_SHIFT ' + '(' + str(dec_bits) + ')\n\n\n')
-                if ("kernel" in var_name ):
-                    f.write('#define ' + var_name.upper() + '_SHIFT ' + '(' + str(dec_bits) + ')\n\n')
-            """
-            # for checking the quantised and dequantised range. 
-            with K.tf.Session() as session:
-                # convert back original range but quantized to 8-bits or 256 levels
-                var_values = var_values / (2 ** dec_bits)
-                var_values = session.run(K.tf.assign(var, var_values))
-                print('  '+var_name + ' number of wts/bias: ' + str(var_values.shape) + \
-                  ' dec bits: ' + str(dec_bits) + \
-                  ' max: (' + str(np.max(var_values)) + ',' + str(max_value) + ')' + \
-                  ' min: (' + str(np.min(var_values)) + ',' + str(min_value) + ')')
-            """
 
-def layers_output_ranges(model, x_test, quantize_method='max_min', calibrate_size=1000):
+def layers_output_ranges(model, x_test, quantize_method="max_min", calibrate_size=1000, verbose=False):
     # limit the test data size
     np.random.shuffle(x_test)
-    if(x_test.shape[0] > calibrate_size):
-        x_test = x_test[:1000]
-    # test, show the output ranges
-    shift_list = {}
-    # FIXME: only support one input
-    if(type(model.layers[0]) != InputLayer):
-        L = [model.input] + model.layers
-    else:
-        L = model.layers
-    last_layer = None
+    if x_test.shape[0] > calibrate_size:
+        x_test = x_test[:calibrate_size]
 
-    for layer in L: # layer loop
-        if("input" in layer.name):
-            features = x_test
-        else:
-            # batch_normalization will need to be handled differently, since we are fusing the weight to its predecessor.
-            # sigmoid and tanh are different, their shift is fixed to 7
-            if(is_shift_layer(layer) or
-                ('batch_normalization' in layer.name)):
-                layer_model = Model(inputs=model.input, outputs=layer.output)
-                features = layer_model.predict(x_test)
-            else:
-                # leave the features not changed, so this layer shift will be the same
-                # as its inputs
-                pass
-        #  calculate no saturation shift
-        max_val = features.max()
-        min_val = features.min()
-        int_bits = int(np.ceil(np.log2(max(abs(max_val), abs(min_val)))))
-        dec_bits = 7 - int_bits
+    shift_list = make_initial_shift_list(
+        model, x_test,
+        quantize_method=quantize_method, verbose=verbose
+    )
 
-        # saturation shift, using KLD method
-        # Ref: http://on-demand.gputechconf.com/gtc/2017/presentation/s7310-8-bit-inference-with-tensorrt.pdf
-        if('kld' in quantize_method and not is_shift_fixed(layer) and "input" not in layer.name and "dense" not in layer.name): # test, also do not use kld in input layer
-            import scipy.stats
-            abs_max = max(abs(max_val), abs(min_val))
-            small_var = 1e-5
-            bins = np.arange(-abs_max, abs_max, abs_max/2048*2)
-            q_bins = np.arange(-abs_max, abs_max, abs_max/256*2)
-            flat_hist = np.histogram(features.flatten(), bins=bins)[0]
-            kl_loss = []
-            kl_shifts = []
-            for shift in range(4):
-                t = 2 ** (dec_bits + shift)     # 2-based threshold
-                act = np.round(features.flatten() * t)
-                act = act / t
-                act = np.clip(act, -128/t, 127/t)
-                act = np.histogram(act, bins=q_bins)[0]
-                act_hist = np.zeros(2047)
-                chunk = int(2048/256)
-                for i in range(int(255)):
-                    none_zero = np.count_nonzero(flat_hist[i*chunk:(i+1)*chunk])
-                    if none_zero == 0:
-                        continue
-                    for j in range(chunk):
-                        act_hist[i*chunk+j] = act[i]/none_zero if flat_hist[i*chunk+j] != 0 else 0
-                flat_hist[flat_hist==0] = small_var
-                act_hist[act_hist==0] = small_var
-                kl = scipy.stats.entropy(flat_hist, act_hist)
-                kl_loss.append(kl)
-                kl_shifts.append(dec_bits + shift)
-                """
-                ax = plt.subplot(8, 1, shift+1)
-                ax.plot(flat_hist)
-                ax.plot(act_hist)
-                """
-            new_dec = kl_shifts[np.argmin(kl_loss)] # set the dec_bit to the KLD results
-            #plt.show()
-            print("KLD loss", kl_loss)
-            print("KLD shift", kl_shifts)
-            if(new_dec != dec_bits):
-                print(layer.name,"is using KLD method, original shift",dec_bits, "KLD results", new_dec)
-                dec_bits = new_dec
-
-        print( layer.name, "max value:", max_val, "min value:", min_val,"dec bit", dec_bits)
-        # record the shift
-        if(type(model.input) == tf.Tensor and type(model.layers[0]) != InputLayer):
-            shift_list[layer.name.split(':')[0]] = dec_bits
-        else:
-            shift_list[layer.name] = dec_bits
-        if ('batch_normalization' in layer.name):
-            shift_list[last_layer.name] = dec_bits  # use the bn layer shift to update the last layer.
-        last_layer = layer
-
-    LM = {}
+    layer_dict = {}
     for layer in model.layers:
-        LM[layer.name] = layer
-    L = [l for l in model.layers[1:]]
-    L.reverse()
+        layer_dict[layer.name] = layer
 
-    def update_previous_layer_shift(layer, Q):
-        if(type(layer.input) == list):
-            for inp in layer.input:
-                iname = inp.name.split('/')[0]
-                if('input' in iname):
-                    continue
-                shift_list[iname] = Qmin
-                if(not is_shift_layer(LM[iname])):
-                    update_previous_layer_shift(LM[iname], Q)
-        else:
-            iname = layer.input.name.split('/')[0]
-            if('input' in iname):
-                return
+    def get_iname(layer):
+        return layer.name.split('/')[0]
+
+    def update_previous_layer_shift(init_layer, Qmin, check_input=True):        
+        layers = init_layer.input if check_input else init_layer
+        if not isinstance(layers, list):
+            layers = [init_layer]
+
+        for layer in layers:
+            if is_input_layer(layer):
+                continue
+            iname = get_iname(layer)
             shift_list[iname] = Qmin
-            if(not is_shift_layer(LM[iname])):
-                update_previous_layer_shift(LM[iname], Q)
-    for layer in L:
-        if(type(layer.input) == list):
-            iname = layer.input[0].name.split('/')[0]
-            Qmin = shift_list[iname]
-            for inp in layer.input:
-                iname = inp.name.split('/')[0]
-                if(shift_list[iname] < Qmin):
-                    Qmin = shift_list[iname]
-                if(shift_list[iname] != Qmin):
-                    bFlag = True
-            for inp in layer.input:
-                iname = inp.name.split('/')[0]
-                shift_list[iname] = Qmin
-                if(not is_shift_layer(LM[iname])):
-                    update_previous_layer_shift(LM[iname], Qmin)
-            print('set shift', Qmin, 'for the input of', layer.name, ':', [inp.name.split('/')[0] for inp in layer.input])
-            if(not is_shift_layer(layer) or Qmin < shift_list[layer.name]): # update current layer's shift only when we cannot change the shift
-                shift_list[layer.name] = Qmin
-    print("shift list", shift_list)
+            if not is_shift_layer(layer_dict[iname]):
+                update_previous_layer_shift(layer_dict[iname], Qmin)
+
+    for layer in reversed(model.layers[1:]):
+        if not isinstance(layer.input, list):
+            continue
+
+        # detemine Qmin
+        Qmin = shift_list[get_iname(layer.input[0])]
+        for inp in layer.input:
+            Qmin = min(Qmin, shift_list[get_iname(inp)])
+
+        for inp in layer.input:
+            update_previous_layer_shift(inp, Qmin, check_input=False)
+
+        if verbose:
+            print(
+                f"Set shift {Qmin} for the input of {layer.name}:",
+                f"{[inp.name.split('/')[0] for inp in layer.input]}"
+            )
+        # update current layer's shift only when we cannot change the shift
+        if not is_shift_layer(layer) or Qmin < shift_list[layer.name]:
+            shift_list[layer.name] = Qmin
+
+    if verbose:
+        print("shift list:", shift_list)
     return shift_list
 
-def generate_model(model, x_test, name='weights.h', format='hwc', quantize_method='max_min'):
-    shift_list = layers_output_ranges(model, x_test, quantize_method=quantize_method)
-    generate_weights(model, name=name, format=format, shift_list=shift_list)
-    if(type(model.layers[0]) != InputLayer):
-        L = [model.input] + model.layers
+
+def generate_model(model, x_test, name='weights.h', format='hwc', quantize_method='max_min', verbose=False):
+    f, *_, shift_list = generate_weights(model, x_test=x_test, format=format, quantize_method=quantize_method, verbose=verbose)
+
+    model_layers = model.layers
+    if not is_input_layer(model.layers[0]):
+        model_layers = [model.input] + model_layers
+
+    def get_iname(layer):
+        return layer.name.replace(':', '/').split('/')[0]
+
+    def to_cpp_var_name(layer_name):
+        return layer_name.upper().replace('/', '_').replace(':', '_')
+
+    def is_skipable_layer(layer):
+        # FIXME: add more that could be skiped
+        # flatten layer can be skipped in HWC but have to present in CHW
+        return (
+            "lambda" in layer.name
+            or "dropout" in layer.name
+            or "batch_normalization" in layer.name
+            or ("flatten" in layer.name and "chw" not in format)
+        )
+
+    f.write('\n/* output encoding for each layer */\n')
+    for layer in model_layers:
+        iname = get_iname(layer)
+        f.write('#define %s_OUTPUT_SHIFT %s\n'%(iname.upper(), shift_list[iname]))
+    
+    f.write('\n/* bias shift and output shift for each layer */\n')
+    for layer in model_layers:
+        if not is_shift_layer(layer):
+            continue
+        iname = layer.name.upper()
+        if (
+                len(layer.weights) == 2
+                and "kernel" in layer.weights[0].name
+                and "bias" in layer.weights[1].name
+            ):
+            kernel, bias = layer.weights
+            kname = to_cpp_var_name(kernel.name)
+            bname = to_cpp_var_name(bias.name)
+            inp = get_iname(layer.input).upper()
+            f.write('#define {0}_OUTPUT_RSHIFT ({1}_OUTPUT_SHIFT+{2}_SHIFT-{0}_OUTPUT_SHIFT)\n'.format(
+                    iname, inp, kname))
+            f.write('#define {0}_BIAS_LSHIFT   ({1}_OUTPUT_SHIFT+{2}_SHIFT-{3}_SHIFT)\n'.format(
+                    iname, inp, kname, bname))
+            f.write('#if {0}_OUTPUT_RSHIFT < 0\n#error {0}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
+            f.write('#if {0}_BIAS_LSHIFT < 0\n#error {0}_BIAS_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
+        # add, sub
+        elif "add" in layer.name or "subtract" in layer.name:
+            # only consider the first, they have been set to same in out_put_range()
+            inp = get_iname(layer.input[0]).upper()
+            f.write('#define {0}_OUTPUT_RSHIFT ({1}_OUTPUT_SHIFT-{0}_OUTPUT_SHIFT)\n'.format(
+                    iname, inp))
+            f.write('#if {0}_OUTPUT_RSHIFT < 0\n#error {0}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
+        # mult is different, Q3.4 * Q3.4 = Q6.8. if mult out is Q4.3, then shift (Q.4+q.4)-Q.3=5. Am I right?
+        elif "multiply" in layer.name:
+            inp = get_iname(layer.input[0]).upper()
+            f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT*2-{iname}_OUTPUT_SHIFT)\n")
+            f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
+
+    ID = 0
+    LI = {}
+    f.write('\n/* weights for each layer */\n')
+    for layer_id, layer in enumerate(model_layers):
+        if is_skipable_layer(layer):
+            inp = get_iname(layer.input)
+            LI[layer.name] = (LI[inp][0], layer)
+        else:
+            if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
+                LI[layer.name.split(':')[0]] = (ID, layer)
+            else:
+                LI[layer.name] = (ID, layer)
+            ID += 1
+
+        if is_input_layer(layer) or not layer.weights:
+            continue
+        for var in layer.weights:
+            var_name = to_cpp_var_name(var.name)
+            if "KERNEL" in var_name:
+                f.write(f"static const int8_t {layer.name}_weights[] = {var_name};\n")
+                f.write('static const nnom_weight_t %s_w = { (const void*)%s_weights, %s_OUTPUT_RSHIFT};\n' % (layer.name, layer.name, layer.name.upper()))
+            elif "BIAS" in var_name:
+                f.write(f"static const int8_t {layer.name}_bias[] = {var_name};\n")
+                f.write('static const nnom_bias_t %s_b = { (const void*)%s_bias, %s_BIAS_LSHIFT};\n' % (layer.name, layer.name, layer.name.upper()))
+
+    f.write("\n/* nnom model */\n")
+    # FIXME: now only support one input and one output
+    sz = 1
+    for d in model.input.shape[1:]:
+        sz *= d
+    f.write(f"const int{'8_t' if sz < 128 else ''} INPUT_LENGTH = {sz};\n")
+    f.write("static int8_t nnom_input_data[INPUT_LENGTH];\n")
+    sz = 1
+    for d in model.output.shape[1:]:
+        sz *= d
+    f.write(f"const int{'8_t' if sz < 128 else ''} OUTPUT_LENGTH = {sz};\n")
+    f.write("static int8_t nnom_output_data[OUTPUT_LENGTH];\n")
+    f.write("static nnom_model_t* nnom_model_create(void)\n{\n")
+    f.write("\tstatic nnom_model_t model;\n")
+
+    if ID > 32:
+        f.write(f"\tnnom_layer_t ** layer = malloc(sizeof(nnom_layer_t *)*{ID + 1});\n")
+        f.write("\tif(NULL == layer) return NULL;\n")
     else:
-        L = model.layers
-    with open(name,'a') as fp:
-        fp.write('\n/* output enconding for each layer */\n')
-        for layer in L:
-            if(type(model.input) == tf.Tensor and type(model.layers[0]) != InputLayer):
-                iname = layer.name.split(':')[0]
-            else:
-                iname = layer.name
-            fp.write('#define %s_OUTPUT_SHIFT %s\n'%(iname.upper(), shift_list[iname]))
-        fp.write('\n/* bias shift and output shift for each layer */\n')
-        for layer in model.layers:
-            if(is_shift_layer(layer)):
-                iname = layer.name.upper()
-                if(len(layer.weights) == 2 and
-                   'kernel' in layer.weights[0].name and
-                   'bias' in layer.weights[1].name):
-                    kname = layer.weights[0].name.upper().replace('/', '_').replace(':', '_')
-                    bname = layer.weights[1].name.upper().replace('/', '_').replace(':', '_')
-                    inp = layer.input.name.replace(':','/').split('/')[0].upper()
-                    fp.write('#define {0}_OUTPUT_RSHIFT ({1}_OUTPUT_SHIFT+{2}_SHIFT-{0}_OUTPUT_SHIFT)\n'.format(
-                            iname, inp, kname))
-                    fp.write('#define {0}_BIAS_LSHIFT   ({1}_OUTPUT_SHIFT+{2}_SHIFT-{3}_SHIFT)\n'.format(
-                            iname, inp, kname, bname))
-                    fp.write('#if {0}_OUTPUT_RSHIFT < 0\n#error {0}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
-                    fp.write('#if {0}_BIAS_LSHIFT < 0\n#error {0}_BIAS_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
-                # add, sub
-                elif ('add' in layer.name or
-                    'subtract' in layer.name):
-                    # only consider the first, they have been set to same in out_put_range()
-                    inp = layer.input[0].name.replace(':','/').split('/')[0].upper()
-                    fp.write('#define {0}_OUTPUT_RSHIFT ({1}_OUTPUT_SHIFT-{0}_OUTPUT_SHIFT)\n'.format(
-                            iname, inp))
-                    fp.write('#if {0}_OUTPUT_RSHIFT < 0\n#error {0}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
-                # mult is different, Q3.4 * Q3.4 = Q6.8. if mult out is Q4.3, then shift (Q.4+q.4)-Q.3=5. Am I right?
-                elif ('multiply' in layer.name ):
-                    inp = layer.input[0].name.replace(':','/').split('/')[0].upper()
-                    fp.write('#define {0}_OUTPUT_RSHIFT ({1}_OUTPUT_SHIFT*2-{0}_OUTPUT_SHIFT)\n'.format(
-                            iname, inp))
-                    fp.write('#if {0}_OUTPUT_RSHIFT < 0\n#error {0}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
+        f.write(f"\tnnom_layer_t* layer[{ID + 1}];\n")
 
-        fp.write('\n/* weights for each layer */\n')
-        LI = {}
-        ID = 0
-        def is_skipable_layer(layer):
-            # FIXME: add more that could be skiped
-            if('lambda' in layer.name or
-               'dropout' in layer.name or
-               'batch_normalization' in layer.name or
-                ('flatten' in layer.name and 'chw' not in format)): # flatten layer can be skipped in HWC but have to present in CHW
-                return True
-            return False
-        for id,layer in enumerate(L):
-            if(is_skipable_layer(layer)):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                LI[layer.name] = (LI[inp][0], layer)
-            else:
-                if(type(model.input) == tf.Tensor and type(model.layers[0]) != InputLayer):
-                    LI[layer.name.split(':')[0]] = (ID, layer)
-                else:
-                    LI[layer.name] = (ID, layer)
-                ID += 1
-
-            if ('input' in layer.name or not layer.weights):
-                continue
-            for var in layer.weights:
-                var_name = str(var.name).replace('/', '_').replace(':', '_')
-                if("kernel" in var_name):
-                    fp.write('static const int8_t %s_weights[] = %s;\n'%(layer.name, var_name.upper()))
-                    fp.write('static const nnom_weight_t %s_w = { (const void*)%s_weights, %s_OUTPUT_RSHIFT};\n'%(layer.name,layer.name, layer.name.upper()))
-                elif("bias" in var_name):
-                    fp.write('static const int8_t %s_bias[] = %s;\n'%(layer.name, var_name.upper()))
-                    fp.write('static const nnom_bias_t %s_b = { (const void*)%s_bias, %s_BIAS_LSHIFT};\n'%(layer.name,layer.name, layer.name.upper()))
-        fp.write('\n/* nnom model */\n')
-        # FIXME: now only support one input and one output
-        sz = 1
-        for d in model.input.shape[1:]:
-            sz = sz*d
-        fp.write('static int8_t nnom_input_data[%d];\n'%(sz))
-        sz = 1
-        for d in model.output.shape[1:]:
-            sz = sz*d
-        fp.write('static int8_t nnom_output_data[%d];\n'%(sz))
-        fp.write('static nnom_model_t* nnom_model_create(void)\n{\n')
-        fp.write('\tstatic nnom_model_t model;\n')
-        if(ID>32):
-            fp.write('\tnnom_layer_t ** layer = malloc(sizeof(nnom_layer_t *)*%d);\n'%(ID+1))
-            fp.write('\tif(NULL == layer) return NULL;\n')
+    f.write("\n\tnew_model(&model);\n\n")
+    for layer in model_layers:
+        if is_skipable_layer(layer):
+            continue
+        #FIXME: need a better solution to seperate the input 'tensor' from other layers
+        if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
+            layer_id, _ = LI[layer.name.split(':')[0]]
         else:
-            fp.write('\tnnom_layer_t* layer[%d];\n'%(ID+1))
-        fp.write('\n\tnew_model(&model);\n\n')
-        for layer in L:
-            if(is_skipable_layer(layer)):
-                continue
-            #FIXME: need a better solution to seperate the input 'tensor' from other layers
-            if (type(model.input) == tf.Tensor and type(model.layers[0]) != InputLayer):
-                id,_ = LI[layer.name.split(':')[0]]
+            layer_id, _ = LI[layer.name]
+        try:
+            inp = get_iname(getattr(layer, "input", None))
+        except AttributeError:
+            inp = ""
+        cfg = getattr(layer, "get_config", lambda: None)()
+
+        if "input" in layer.name:
+            try:
+                inshape = layer.input_shape[0][1:] # new changes in tf2?
+            except:
+                inshape = layer.shape[1:]
+            if len(inshape) == 1:  # 1-D input
+                f.write('\tlayer[%d] = Input(shape(%d,1,1), nnom_input_data);\n' % (layer_id, inshape[0]))
+            elif len(inshape) == 2:  # 1-D input
+                f.write('\tlayer[%d] = Input(shape(1,%d,%d), nnom_input_data);\n' % (layer_id, inshape[0], inshape[1]))
             else:
-                id,_ = LI[layer.name]
+                f.write('\tlayer[%d] = Input(shape%s, nnom_input_data);\n' % (layer_id, inshape))
 
-            if('input' in layer.name):
-                try:
-                    inshape = layer.input_shape[0][1:] # new changes in tf2?
-                except:
-                    inshape = layer.shape[1:]
-                if (len(inshape) == 1):  # 1-D input
-                    fp.write('\tlayer[%d] = Input(shape(%d,1,1), nnom_input_data);\n' % (id, inshape[0]))
-                elif (len(inshape) == 2):  # 1-D input
-                    fp.write('\tlayer[%d] = Input(shape(1,%d,%d), nnom_input_data);\n' % (id, inshape[0], inshape[1]))
-                else:
-                    fp.write('\tlayer[%d] = Input(shape%s, nnom_input_data);\n' % (id, inshape))
+        # convolutional
+        elif "conv" in layer.name:
+            is_depthwise = "depthwise" in layer.name
+            num_filters = 1 if is_depthwise else cfg["filters"]
+            conv_type = "Conv2D"
+            if is_depthwise:
+                conv_type = "DW_" + conv_type
 
-            # convlutional
-            elif('conv1d' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if('depthwise' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(DW_Conv2D({1}, kernel(1,{2}), stride(1,{3}), dilation(1,{4}), PADDING_{5}, &{6}_w, &{6}_b), layer[{7}]);\n'.format(
-                        id, 1, cfg['kernel_size'][0], cfg['strides'][0], cfg['dilation_rate'][0], cfg['padding'].upper(),
-                        layer.name, LI[inp][0]))
-                else:
-                    fp.write('\tlayer[{0}] = model.hook(Conv2D({1}, kernel(1,{2}), stride(1,{3}), dilation(1,{4}), PADDING_{5}, &{6}_w, &{6}_b), layer[{7}]);\n'.format(
-                        id, cfg['filters'], cfg['kernel_size'][0], cfg['strides'][0], cfg['dilation_rate'][0], cfg['padding'].upper(),
-                        layer.name, LI[inp][0]))
-            elif('conv2d' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if ('depthwise' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(DW_Conv2D({1}, kernel{2}, stride{3}, dilation{4}, PADDING_{5}, &{6}_w, &{6}_b), layer[{7}]);\n'.format(
-                        id, 1, cfg['kernel_size'], cfg['strides'], cfg['dilation_rate'], cfg['padding'].upper(),
-                        layer.name, LI[inp][0]))
-                else:
-                    fp.write('\tlayer[{0}] = model.hook(Conv2D({1}, kernel{2}, stride{3}, dilation{4}, PADDING_{5}, &{6}_w, &{6}_b), layer[{7}]);\n'.format(
-                        id, cfg['filters'], cfg['kernel_size'], cfg['strides'], cfg['dilation_rate'], cfg['padding'].upper(),
-                        layer.name, LI[inp][0]))
-            # activations
-            elif('activation' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if(cfg['activation'] == 'relu'):
-                    fp.write('\tlayer[%s] = model.active(act_relu(), layer[%s]);\n'%(id, LI[inp][0]))
-                if(cfg['activation'] == 'tanh'):
-                    fp.write('\tlayer[%s] = model.active(act_tanh(%s_OUTPUT_SHIFT), layer[%s]);\n'%(id, inp.upper(), LI[inp][0]))
-                if(cfg['activation'] == 'sigmoid'):
-                    fp.write('\tlayer[%s] = model.active(act_sigmoid(%s_OUTPUT_SHIFT), layer[%s]);\n'%(id, inp.upper(), LI[inp][0]))
-                elif(cfg['activation'] == 'softmax'):
-                    fp.write('\tlayer[%s] = model.hook(Softmax(), layer[%s]);\n'%(id, LI[inp][0]))
-            elif('re_lu' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                fp.write('\tlayer[%s] = model.active(act_relu(), layer[%s]);\n'%(id, LI[inp][0]))
-            # pooling
-            elif('max_pooling' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if ('global' in layer.name):
-                    fp.write('\tlayer[%s] = model.hook(GlobalMaxPool(),  layer[%s]);\n' % (id, LI[inp][0]))
-                elif('2d' in layer.name):
-                    fp.write('\tlayer[%s] = model.hook(MaxPool(kernel%s, stride%s, PADDING_%s), layer[%d]);\n'%(
-                        id, cfg['pool_size'], cfg['strides'], cfg['padding'].upper(), LI[inp][0]))
-                elif('1d' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(MaxPool(kernel(1,{1}), stride(1,{2}), PADDING_{3}), layer[{4}]);\n'.format(
-                        id, cfg['pool_size'][0], cfg['strides'][0], cfg['padding'].upper(), LI[inp][0]))
-            elif('average_pooling' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if ('global' in layer.name):
-                    # a global avg pool before softmax can be replace by sumpool in MCU (recommend)
-                    if(layer == model.layers[-2] and 'Softmax' in model.layers[-1].output.name):
+            # Expand kernel, stride, and dilation for 1D conv
+            kernel, stride, dilation = pad_filter_sizes(
+                cfg['kernel_size'], cfg['strides'], cfg['dilation_rate']
+            )
+            f.write(
+                f"\tlayer[{layer_id}] = model.hook("
+                + f"{conv_type}({num_filters}, kernel{kernel}, "
+                + f"stride{stride}, dilation{dilation}, "
+                + f"PADDING_{cfg['padding']}, &{layer.name}_w, "
+                + f"&{layer.name}_b), layer[{LI[inp][0]}]);\n"
+            )
+
+        # activations
+        elif "activation" in layer.name:
+            activ_name = cfg["activation"]
+            if activ_name in ["tanh", "sigmoid"]:
+                f.write(f"\tlayer[{layer_id}] = model.active(act_{activ_name}({inp.upper()}_OUTPUT_SHIFT), layer[{LI[inp][0]}]);\n")
+            elif activ_name in ["softmax", "relu"]:
+                func_name = "Softmax" if activ_name == "softmax" else "act_relu"
+                func_type = "hook" if activ_name == "softmax" else "active"
+                f.write(f"\tlayer[{layer_id}] = model.{func_type}({func_name}(), layer[{LI[inp][0]}]);\n")
+            elif activ_name != "linear":
+                raise Exception(f"{activ_name} activation is unsupported.")
+        # ReLU
+        elif "re_lu" in layer.name:
+            f.write(f"\tlayer[{layer_id}] = model.active(act_relu(), layer[{LI[inp][0]}]);\n")
+
+        # pooling
+        elif "pooling" in layer.name:
+            pooling_type = "Avg" if "average" in layer.name else layer.name[:3].capitalize()
+            if "global" in layer.name:
+                # a global avg pool before softmax can be replace by sumpool in MCU (recommend)
+                if pooling_type == "Avg" and layer == model.layers[-2] and "Softmax" in model.layers[-1].output.name:
+                    if verbose:
                         print(layer.name, 'has been replaced by GlobalSumPool()')
-                        fp.write('\tlayer[%s] = model.hook(GlobalSumPool(),  layer[%s]);\n' % (id, LI[inp][0]))
-                    else:
-                        fp.write('\tlayer[%s] = model.hook(GlobalAvgPool(),  layer[%s]);\n' % (id, LI[inp][0]))
-                elif('2d' in layer.name):
-                    fp.write('\tlayer[%s] = model.hook(AvgPool(kernel%s, stride%s, PADDING_%s), layer[%d]);\n'%(
-                        id, cfg['pool_size'], cfg['strides'], cfg['padding'].upper(), LI[inp][0]))
-                elif('1d' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(AvgPool(kernel(1,{1}), stride(1,{2}), PADDING_{3}), layer[{4}]);\n'.format(
-                        id, cfg['pool_size'][0], cfg['strides'][0], cfg['padding'].upper(), LI[inp][0]))
-            elif ('up_sampling' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if('2d' in layer.name):
-                    fp.write('\tlayer[%s] = model.hook(UpSample(kernel%s), layer[%d]);\n'%(id, cfg['size'],  LI[inp][0]))
-                elif('1d' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(UpSample(kernel(1,{1})), layer[{2}]);\n'.format(
-                        id,  cfg['size'][0], LI[inp][0]))
-            # zero padding
-            elif ('zero_padding' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if('2d' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(ZeroPadding(border({1},{2},{3},{4})), layer[{5}]);\n'.format(
-                        id,  cfg['padding'][0][0], cfg['padding'][0][1], cfg['padding'][1][0],cfg['padding'][1][1], LI[inp][0]))
-                elif('1d' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(ZeroPadding(border(0,0,{1},{2})), layer[{3}]);\n'.format(
-                        id,  cfg['padding'][0], cfg['padding'][1], LI[inp][0]))
-            # Cropping
-            elif ('cropping' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                if('2d' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(Cropping(border({1},{2},{3},{4})), layer[{5}]);\n'.format(
-                        id,  cfg['cropping'][0][0], cfg['cropping'][0][1], cfg['cropping'][1][0],cfg['cropping'][1][1], LI[inp][0]))
-                elif('1d' in layer.name):
-                    fp.write('\tlayer[{0}] = model.hook(Cropping(border(0,0,{1},{2})), layer[{3}]);\n'.format(
-                        id,  cfg['cropping'][0], cfg['cropping'][1], LI[inp][0]))
-
-            # others
-            elif('flatten' in layer.name): # flatten is needed in CHW backend but not needed in HWC
-                inp = layer.input.name.replace(':', '/').split('/')[0]
-                fp.write('\tlayer[%s] = model.hook(Flatten(), layer[%s]);\n'%(id, LI[inp][0]))
-            elif('concatenate' in layer.name):
-                inps = [input.name.replace(':','/').split('/')[0] for input in layer.input]
-                inX = ''
-                for inp in inps:
-                    inX += ' ,layer[%d]'%(LI[inp][0])
-                cfg = layer.get_config()
-                fp.write('\tlayer[%s] = model.mergex(Concat(%s), %s%s);\n'%(
-                    id, cfg['axis'], len(inps), inX))
-            elif('add' in layer.name):
-                inps = [input.name.replace(':','/').split('/')[0] for input in layer.input]
-                inX = ''
-                for inp in inps:
-                    inX += ' ,layer[%d]'%(LI[inp][0])
-                fp.write('\tlayer[%s] = model.mergex(Add(%s_OUTPUT_RSHIFT), %s%s);\n'%(
-                    id, layer.name.upper(), len(inps), inX))
-            elif('subtract' in layer.name):
-                inps = [input.name.replace(':','/').split('/')[0] for input in layer.input]
-                inX = ''
-                for inp in inps:
-                    inX += ' ,layer[%d]'%(LI[inp][0])
-                fp.write('\tlayer[%s] = model.mergex(Sub(%s_OUTPUT_RSHIFT), %s%s);\n'%(
-                    id, layer.name.upper(), len(inps), inX))
-            elif('multiply' in layer.name):
-                warnings.warn("Warning mutiply is under testing")
-                inps = [input.name.replace(':','/').split('/')[0] for input in layer.input]
-                inX = ''
-                for inp in inps:
-                    inX += ' ,layer[%d]'%(LI[inp][0])
-                fp.write('\tlayer[%s] = model.mergex(Mult(%s_OUTPUT_RSHIFT), %s%s);\n'%(
-                    id, layer.name.upper(), len(inps), inX))
-            elif('dense' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                cfg = layer.get_config()
-                fp.write('\tlayer[{0}] = model.hook(Dense({1}, &{2}_w, &{2}_b), layer[{3}]);\n'.format(
-                    id, cfg['units'], layer.name, LI[inp][0]))
-            elif('softmax' in layer.name):
-                inp = layer.input.name.replace(':','/').split('/')[0]
-                fp.write('\tlayer[%s] = model.hook(Softmax(), layer[%s]);\n'%(id, LI[inp][0]))
+                    f.write(f"\tlayer[{layer_id}] = model.hook(GlobalSumPool(), layer[{LI[inp][0]}]);\n")
+                else:
+                    f.write(f"\tlayer[{layer_id}] = model.hook(Global{pooling_type}Pool(), layer[{LI[inp][0]}]);\n")
             else:
-                raise Exception('unsupported layer', layer.name, layer)
-			
-            """
-            # temporary fixed for activations attached into layers in construction
-            def is_activation_attached(layer):
-                if(("Softmax" in layer.output.name and "softmax" not in layer.name)or
-                ("Relu" in layer.output.name and "re_lu" not in layer.name) or
-                ("Sigmoid" in layer.output.name and "sigmoid" not in layer.name) or
-                ("Tanh" in layer.output.name and "tanh" not in layer.name)):
-                    return True
-                return False
-            if "input" not in layer.name and is_activation_attached(layer):
-                inp = layer.output.name.replace(':', '/').split('/')[0]
-                cfg = layer.get_config()
-                if(cfg['activation'] == 'relu'):
-                    fp.write('\tlayer[%s] = model.active(act_relu(), layer[%s]);\n'%(id, LI[inp][0]))
-                if(cfg['activation'] == 'tanh'):
-                    fp.write('\tlayer[%s] = model.active(act_tanh(%s_OUTPUT_SHIFT), layer[%s]);\n'%(id, inp.upper(), LI[inp][0]))
-                if(cfg['activation'] == 'sigmoid'):
-                    fp.write('\tlayer[%s] = model.active(act_sigmoid(%s_OUTPUT_SHIFT), layer[%s]);\n'%(id, inp.upper(), LI[inp][0]))
-                elif(cfg['activation'] == 'softmax'):
-                    fp.write('\tlayer[%s] = model.hook(Softmax(), layer[%s]);\n'%(id, LI[inp][0]))
-            """
-			
-        # FIXME, test later.
-        if('softmax' in layer.name
-           or ('activation' in layer.name and layer.get_config()['activation'] == 'softmax')):
-            fp.write('\tlayer[%s] = model.hook(Output(shape(%s,1,1), nnom_output_data), layer[%s]);\n'%(id+1, layer.output.shape[1], id))
-        elif len(layer.output.shape) == 4:
-            fp.write('\tlayer[%s] = model.hook(Output(shape%s, nnom_output_data), layer[%s]);\n'%(id+1, layer.output.shape[1:], id))
-        elif len(layer.output.shape) == 3:
-            fp.write('\tlayer[%s] = model.hook(Output(shape(1,%s,%s), nnom_output_data), layer[%s]);\n'%(id+1, layer.output.shape[1], layer.output.shape[2], id))
-        elif len(layer.output.shape) == 2:
-            fp.write('\tlayer[%s] = model.hook(Output(shape(%s,1,1), nnom_output_data), layer[%s]);\n'%(id+1, layer.output.shape[1], id))
+                # Expand 1D Pooling params
+                pool_size, strides = pad_filter_sizes(cfg["pool_size"], cfg["strides"])
+                padding = cfg["padding"].upper()
+                f.write(
+                    f"\tlayer[{layer_id}] = model.hook("
+                    + f"{pooling_type}Pool("
+                    + f"kernel{pool_size}, stride{strides}, PADDING_{padding}"
+                    + f"), layer[{LI[inp][0]}]);\n"
+                )
+        elif "up_sampling" in layer.name:
+            size = pad_filter_sizes(cfg["size"])[0]
+            f.write(f"\tlayer[{layer_id}] = model.hook(UpSample(kernel{size}), layer[{LI[inp][0]}]);\n")
+
+        # Zero padding / Cropping
+        elif "zero_padding" in layer.name or "cropping" in layer.name:
+            is_padding = "zero_padding" in layer.name
+            config_var = "padding" if is_padding else "cropping"
+            func_name = "ZeroPadding" if is_padding else "Cropping"
+            border_size = pad_filter_sizes(flatten(cfg[config_var]), pad_val=0, shape=4)[0]
+            f.write(f"\tlayer[{layer_id}] = model.hook({func_name}(border{border_size}), layer[{LI[inp][0]}]);\n")
+
+        # others
+        elif "flatten" in layer.name: # flatten is needed in CHW backend but not needed in HWC
+            f.write(f"\tlayer[{layer_id}] = model.hook(Flatten(), layer[{LI[inp][0]}]);\n")
+        elif any(merge_name in layer.name for merge_name in ["concatenate", "add", "subtract", "multiply"]):
+            inps = [get_iname(input) for input in layer.input]
+            inX = ", ".join([f"layer[{LI[inp][0]}]" for inp in inps])
+            if "concatenate" in layer.name:
+                f.write(f"\tlayer[{layer_id}] = model.mergex(Concat({cfg['axis']}), {len(inps)}, {inX});\n")
+            else:
+                func_name = "Mult" if "multiply" in layer.name else layer.name[:3].capitalize()
+                if func_name == "Mult":
+                    warnings.warn("Warning mutiply is under testing")
+                f.write(
+                    f"\tlayer[{layer_id}] = model.mergex("
+                    + f"{func_name}({layer.name.upper()}_OUTPUT_RSHIFT), {len(inps)}{inX});\n"
+                )
+        elif "dense" in layer.name:
+            f.write(
+                f"\tlayer[{layer_id}] = model.hook("
+                + f"Dense({cfg['units']}, &{layer.name}_w, &{layer.name}_b), layer[{LI[inp][0]}]);\n"
+            )
+        elif "softmax" in layer.name:
+            f.write(f"\tlayer[{layer_id}] = model.hook(Softmax(), layer[{LI[inp][0]}]);\n")
         else:
-            raise Exception('unsupported output shape of the last layer', layer.name, layer)
-        fp.write('\tmodel_compile(&model, layer[0], layer[%s]);\n'%(id+1))
-        if(ID>32):
-            fp.write('\tfree(layer);\n')
-        fp.write('\treturn &model;\n}\n')
-    with open('.shift_list','w') as fp:
-        fp.write(str(shift_list))
+            raise Exception("unsupported layer", layer.name, layer)
+
+    # FIXME, test later.
+    if (
+        "softmax" in layer.name
+        or len(layer.output.shape) == 2
+        or ("activation" in layer.name and layer.get_config()["activation"] == "softmax")
+    ):
+        out_shape = (layer.output.shape[1], 1, 1)
+    elif len(layer.output.shape) == 4:
+        out_shape = layer.output.shape[1:]
+    elif len(layer.output.shape) == 3:
+        out_shape = (1, layer.output.shape[1], layer.output.shape[2])
+    else:
+        raise Exception("unsupported output shape of the last layer", layer.name, layer)
+    f.write(f"\tlayer[{layer_id + 1}] = model.hook(Output(shape{out_shape}, nnom_output_data), layer[{layer_id}]);\n")
+    f.write(f"\tmodel_compile(&model, layer[0], layer[{layer_id + 1}]);\n")
+    if ID > 32:
+        f.write("\tfree(layer);\n")
+    f.write("\treturn &model;\n}\n")
+    save_root, _ = os.path.split(name)
+    with open(os.path.join(save_root, ".shift_list"), 'w') as file:
+        file.write(str(shift_list))
+    with open(name, 'w+', encoding="utf-8") as file:
+        file.write(f.getvalue())
+
 
 def evaluate_model(model, x_test, y_test, running_time=False, to_file='evaluation.txt'):
     # Score trained model.
@@ -842,4 +910,3 @@ def compare(a,b,name):
     plt.grid()
     plt.title('nn-%s'%(name))
     plt.show()
-
