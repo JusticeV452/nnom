@@ -488,13 +488,13 @@ def layers_output_ranges(model, x_test, quantize_method="max_min", calibrate_siz
     def get_iname(layer):
         return layer.name.split('/')[0]
 
-    def update_previous_layer_shift(init_layer, Qmin, check_input=True):        
-        layers = init_layer.input if check_input else init_layer
+    def update_previous_layer_shift(init_layer, Qmin, skip_input=True):
+        layers = init_layer.input
         if not isinstance(layers, list):
-            layers = [init_layer]
+            layers = [layers]
 
         for layer in layers:
-            if is_input_layer(layer):
+            if skip_input and is_input_layer(layer):
                 continue
             iname = get_iname(layer)
             shift_list[iname] = Qmin
@@ -510,8 +510,7 @@ def layers_output_ranges(model, x_test, quantize_method="max_min", calibrate_siz
         for inp in layer.input:
             Qmin = min(Qmin, shift_list[get_iname(inp)])
 
-        for inp in layer.input:
-            update_previous_layer_shift(inp, Qmin, check_input=False)
+        update_previous_layer_shift(layer, Qmin, skip_input=False)
 
         if verbose:
             print(
