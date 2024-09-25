@@ -334,7 +334,7 @@ def quantize_rnn_intermediate_output(layer, features):
         output_arrary = []
         h_array = []
         h2_array = []
-        activation = nnom_tanh if cfg['activation'] is 'tanh' else nnom_sigmoid
+        activation = nnom_tanh if cfg['activation'] == 'tanh' else nnom_sigmoid
         state = np.zeros(cfg['units'])
         for feature in features:
             if(not layer.stateful):
