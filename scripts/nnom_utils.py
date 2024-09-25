@@ -132,7 +132,7 @@ def dec_bits_by_kld(layer: kl.Layer, features, dec_bits: int, verbose: bool=Fals
 
 
 def make_initial_shift_list(
-        model: keras.Model, x_test: np.array,
+        model: keras.Model, x_test: np.array | List[np.array],
         quantize_method: str="max_min", verbose: bool=False):
     shift_list = {}
     last_layer = None
@@ -142,14 +142,15 @@ def make_initial_shift_list(
             return model.predict(inp)
         return model(inp).numpy()
 
-    # FIXME: only support one input
     model_layers = model.layers
     if not is_input_layer(model.layers[0]):
         model_layers = [model.input] + model_layers
 
+    inp_idx = 0
     for layer in model_layers: # layer loop
         if is_input_layer(layer):
-            features = x_test
+            features = x_test[inp_idx] if isinstance(x_test, list) else x_test
+            inp_idx += 1
         # batch_normalization will need to be handled differently, since we are fusing the weight to its predecessor.
         # sigmoid and tanh are different, their shift is fixed to 7
         elif is_shift_layer(layer) or "batch_normalization" in layer.name:
@@ -339,17 +340,17 @@ def fuse_bn_to_conv(layer):
 
 def generate_weights(
         model: keras.Model, x_test: np.array=None, quantize_method="max_min",
-        calibrate_size=1000, format="hwc", verbose=False):
+        max_calibrate_size=1000, fmt="hwc", verbose=False):
     # Quantize weights to 8-bits using (min,max) and write to file
     f = io.StringIO()
     f.write('#include "nnom.h"\n\n')
 
-    if type(x_test) is type(None):
+    if isinstance(x_test, type(None)):
         shift_list = None
     else:
         shift_list = layers_output_ranges(
             model, x_test, quantize_method=quantize_method,
-            calibrate_size=calibrate_size, verbose=verbose
+            max_calibrate_size=max_calibrate_size, verbose=verbose
         )
 
     layer_quantize_info = {}
@@ -435,7 +436,7 @@ def generate_weights(
             f.write("#define " + var_name.upper() + " {")
 
             # CHW format
-            if "chw" in format:
+            if "chw" in fmt:
                 if is_kernel and "dense" in var_name:
                     transposed_wts = to_transposed_x4_q7_weights(var_values)
                 # all other kernels, bias stay the same
@@ -470,12 +471,18 @@ def generate_weights(
     return f, layer_weights, layer_quantize_info, shift_list
 
 
-def layers_output_ranges(model, x_test, quantize_method="max_min", calibrate_size=1000, verbose=False):
-    # limit the test data size
-    np.random.shuffle(x_test)
-    if x_test.shape[0] > calibrate_size:
-        x_test = x_test[:calibrate_size]
+def layers_output_ranges(model, x_test, quantize_method="max_min", max_calibrate_size=1000, verbose=False):
+    def clamp_input(input_arr):
+        # limit the test data size
+        np.random.shuffle(input_arr)
+        if input_arr.shape[0] > max_calibrate_size:
+            input_arr = input_arr[:max_calibrate_size]
+        return input_arr
 
+    if isinstance(x_test, list):
+        x_test = [clamp_input(inp) for inp in x_test]
+    else:
+        x_test = clamp_input(x_test)
     shift_list = make_initial_shift_list(
         model, x_test,
         quantize_method=quantize_method, verbose=verbose
@@ -526,8 +533,13 @@ def layers_output_ranges(model, x_test, quantize_method="max_min", calibrate_siz
     return shift_list
 
 
-def generate_model(model, x_test, name='weights.h', format='hwc', quantize_method='max_min', verbose=False):
-    f, *_, shift_list = generate_weights(model, x_test=x_test, format=format, quantize_method=quantize_method, verbose=verbose)
+def generate_model(
+        model, x_test, name='weights.h', fmt='hwc', quantize_method='max_min',
+        max_calibrate_size=1000, verbose=False):
+    f, *_, shift_list = generate_weights(
+        model, x_test=x_test, fmt=fmt, quantize_method=quantize_method,
+        max_calibrate_size=max_calibrate_size, verbose=verbose
+    )
 
     model_layers = model.layers
     if not is_input_layer(model.layers[0]):
@@ -546,14 +558,25 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
             "lambda" in layer.name
             or "dropout" in layer.name
             or "batch_normalization" in layer.name
-            or ("flatten" in layer.name and "chw" not in format)
+            or ("flatten" in layer.name and "chw" not in fmt)
         )
+    
+    def add_activation(layer, inp, layer_id, cfg):
+        activ_name = cfg.get("activation")
+        if activ_name in ["tanh", "sigmoid"]:
+            f.write(f"\tlayer[{layer_id}] = model.active(act_{activ_name}({inp.upper()}_OUTPUT_SHIFT), layer[{LI[inp][0]}]);\n")
+        elif "re_lu" in layer.name or activ_name in ["softmax", "relu"]:
+            func_name = "Softmax" if activ_name == "softmax" else "act_relu"
+            func_type = "hook" if activ_name == "softmax" else "active"
+            f.write(f"\tlayer[{layer_id}] = model.{func_type}({func_name}(), layer[{LI[inp][0]}]);\n")
+        elif activ_name != "linear":
+            raise Exception(f"{activ_name} activation is unsupported.")
 
     f.write('\n/* output encoding for each layer */\n')
     for layer in model_layers:
         iname = get_iname(layer)
-        f.write('#define %s_OUTPUT_SHIFT %s\n'%(iname.upper(), shift_list[iname]))
-    
+        f.write(f"#define {iname.upper()}_OUTPUT_SHIFT {shift_list[iname]}\n")
+
     f.write('\n/* bias shift and output shift for each layer */\n')
     for layer in model_layers:
         if not is_shift_layer(layer):
@@ -568,19 +591,16 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
             kname = to_cpp_var_name(kernel.name)
             bname = to_cpp_var_name(bias.name)
             inp = get_iname(layer.input).upper()
-            f.write('#define {0}_OUTPUT_RSHIFT ({1}_OUTPUT_SHIFT+{2}_SHIFT-{0}_OUTPUT_SHIFT)\n'.format(
-                    iname, inp, kname))
-            f.write('#define {0}_BIAS_LSHIFT   ({1}_OUTPUT_SHIFT+{2}_SHIFT-{3}_SHIFT)\n'.format(
-                    iname, inp, kname, bname))
-            f.write('#if {0}_OUTPUT_RSHIFT < 0\n#error {0}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
-            f.write('#if {0}_BIAS_LSHIFT < 0\n#error {0}_BIAS_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
+            f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT+{kname}_SHIFT-{iname}_OUTPUT_SHIFT)\n")
+            f.write(f"#define {iname}_BIAS_LSHIFT   ({inp}_OUTPUT_SHIFT+{kname}_SHIFT-{bname}_SHIFT)\n")
+            f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
+            f.write(f"#if {iname}_BIAS_LSHIFT < 0\n#error {iname}_BIAS_RSHIFT must be bigger than 0\n#endif\n")
         # add, sub
         elif "add" in layer.name or "subtract" in layer.name:
             # only consider the first, they have been set to same in out_put_range()
             inp = get_iname(layer.input[0]).upper()
-            f.write('#define {0}_OUTPUT_RSHIFT ({1}_OUTPUT_SHIFT-{0}_OUTPUT_SHIFT)\n'.format(
-                    iname, inp))
-            f.write('#if {0}_OUTPUT_RSHIFT < 0\n#error {0}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n'.format(iname))
+            f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT-{iname}_OUTPUT_SHIFT)\n")
+            f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
         # mult is different, Q3.4 * Q3.4 = Q6.8. if mult out is Q4.3, then shift (Q.4+q.4)-Q.3=5. Am I right?
         elif "multiply" in layer.name:
             inp = get_iname(layer.input[0]).upper()
@@ -595,10 +615,10 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
             inp = get_iname(layer.input)
             LI[layer.name] = (LI[inp][0], layer)
         else:
+            layer_name = layer.name
             if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
-                LI[layer.name.split(':')[0]] = (ID, layer)
-            else:
-                LI[layer.name] = (ID, layer)
+                layer_name = layer.name.split(':')[0]
+            LI[layer_name] = (ID, layer)
             ID += 1
 
         if is_input_layer(layer) or not layer.weights:
@@ -613,12 +633,22 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
                 f.write('static const nnom_bias_t %s_b = { (const void*)%s_bias, %s_BIAS_LSHIFT};\n' % (layer.name, layer.name, layer.name.upper()))
 
     f.write("\n/* nnom model */\n")
-    # FIXME: now only support one input and one output
-    sz = 1
-    for d in model.input.shape[1:]:
-        sz *= d
-    f.write(f"const int{'8_t' if sz < 128 else ''} INPUT_LENGTH = {sz};\n")
-    f.write("static int8_t nnom_input_data[INPUT_LENGTH];\n")
+    # FIXME: now only support one output
+    inp_sizes = []
+    max_idx = 0
+    inp_list = get_input_list(model)
+    for i, inp in enumerate(inp_list):
+        sz = 1
+        for d in inp.shape[1:]:
+            sz *= d
+        inp_sizes.append(sz)
+        if inp_sizes[i] > inp_sizes[max_idx]:
+            max_idx = i
+    f.write(f"const int8_t NUM_INPUTS = {len(inp_sizes)};\n")
+    f.write(f"const int{'8_t' if sz < 128 else ''} INPUT_LENGTHS[] = ")
+    f.write('{' + str(inp_sizes)[1:-1] + "};\n")
+    f.write(f"const int8_t IN_DATA_WIDTH = {inp_sizes[max_idx]};\n"
+    f.write(f"static int8_t nnom_input_data[NUM_INPUTS][IN_DATA_WIDTH];\n")
     sz = 1
     for d in model.output.shape[1:]:
         sz *= d
@@ -634,6 +664,7 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
         f.write(f"\tnnom_layer_t* layer[{ID + 1}];\n")
 
     f.write("\n\tnew_model(&model);\n\n")
+    inp_idx = 0
     for layer in model_layers:
         if is_skipable_layer(layer):
             continue
@@ -654,11 +685,12 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
             except:
                 inshape = layer.shape[1:]
             if len(inshape) == 1:  # 1-D input
-                f.write('\tlayer[%d] = Input(shape(%d,1,1), nnom_input_data);\n' % (layer_id, inshape[0]))
+                f.write(f"\tlayer[{layer_id}] = Input(shape({inshape[0]}, 1, 1), nnom_input_data[{inp_idx}]);\n")
             elif len(inshape) == 2:  # 1-D input
-                f.write('\tlayer[%d] = Input(shape(1,%d,%d), nnom_input_data);\n' % (layer_id, inshape[0], inshape[1]))
+                f.write(f"\tlayer[{layer_id}] = Input(shape(1, {inshape[0]}, {inshape[1]}), nnom_input_data[{inp_idx}]);\n")
             else:
-                f.write('\tlayer[%d] = Input(shape%s, nnom_input_data);\n' % (layer_id, inshape))
+                f.write(f"\tlayer[{layer_id}] = Input(shape{inshape}, nnom_input_data[{inp_idx}]);\n")
+            inp_idx += 1
 
         # convolutional
         elif "conv" in layer.name:
@@ -681,19 +713,8 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
             )
 
         # activations
-        elif "activation" in layer.name:
-            activ_name = cfg["activation"]
-            if activ_name in ["tanh", "sigmoid"]:
-                f.write(f"\tlayer[{layer_id}] = model.active(act_{activ_name}({inp.upper()}_OUTPUT_SHIFT), layer[{LI[inp][0]}]);\n")
-            elif activ_name in ["softmax", "relu"]:
-                func_name = "Softmax" if activ_name == "softmax" else "act_relu"
-                func_type = "hook" if activ_name == "softmax" else "active"
-                f.write(f"\tlayer[{layer_id}] = model.{func_type}({func_name}(), layer[{LI[inp][0]}]);\n")
-            elif activ_name != "linear":
-                raise Exception(f"{activ_name} activation is unsupported.")
-        # ReLU
-        elif "re_lu" in layer.name:
-            f.write(f"\tlayer[{layer_id}] = model.active(act_relu(), layer[{LI[inp][0]}]);\n")
+        elif "activation" in layer.name or "re_lu" in layer.name:
+            add_activation(layer, inp, layer_id, cfg)
 
         # pooling
         elif "pooling" in layer.name:
@@ -728,9 +749,11 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
             border_size = pad_filter_sizes(flatten(cfg[config_var]), pad_val=0, shape=4)[0]
             f.write(f"\tlayer[{layer_id}] = model.hook({func_name}(border{border_size}), layer[{LI[inp][0]}]);\n")
 
-        # others
+        # Flatten
         elif "flatten" in layer.name: # flatten is needed in CHW backend but not needed in HWC
             f.write(f"\tlayer[{layer_id}] = model.hook(Flatten(), layer[{LI[inp][0]}]);\n")
+
+        # Multi-input layers
         elif any(merge_name in layer.name for merge_name in ["concatenate", "add", "subtract", "multiply"]):
             inps = [get_iname(input) for input in layer.input]
             inX = ", ".join([f"layer[{LI[inp][0]}]" for inp in inps])
@@ -744,13 +767,14 @@ def generate_model(model, x_test, name='weights.h', format='hwc', quantize_metho
                     f"\tlayer[{layer_id}] = model.mergex("
                     + f"{func_name}({layer.name.upper()}_OUTPUT_RSHIFT), {len(inps)}{inX});\n"
                 )
+
+        # Dense
         elif "dense" in layer.name:
             f.write(
                 f"\tlayer[{layer_id}] = model.hook("
                 + f"Dense({cfg['units']}, &{layer.name}_w, &{layer.name}_b), layer[{LI[inp][0]}]);\n"
             )
-        elif "softmax" in layer.name:
-            f.write(f"\tlayer[{layer_id}] = model.hook(Softmax(), layer[{LI[inp][0]}]);\n")
+
         else:
             raise Exception("unsupported layer", layer.name, layer)
 
