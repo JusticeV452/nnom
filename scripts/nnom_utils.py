@@ -35,7 +35,24 @@ from tensorflow.keras.models import Model
 from sklearn import metrics
 
 from .fully_connected_opt_weight_generation import *
-from utils import is_input_layer
+
+
+def is_input_layer(layer: kl.Layer):
+    """
+    Check if layer is an input layer
+
+    Parameters
+    ----------
+    layer : kl.Layer
+
+    Returns
+    -------
+    bool
+        True if layer is an input layer, False otherwise.
+
+    """
+    return "input" in layer.name
+
 
 def get_int_bits(min_value: float, max_value: float):
     """
