@@ -685,7 +685,7 @@ def generate_model(
     f.write(f"const int8_t NUM_INPUTS = {len(inp_sizes)};\n")
     f.write(f"const int{'8_t' if sz < 128 else ''} INPUT_LENGTHS[] = ")
     f.write('{' + str(inp_sizes)[1:-1] + "};\n")
-    f.write(f"const int8_t IN_DATA_WIDTH = {inp_sizes[max_idx]};\n"
+    f.write(f"const int8_t IN_DATA_WIDTH = {inp_sizes[max_idx]};\n")
     f.write(f"static int8_t nnom_input_data[NUM_INPUTS][IN_DATA_WIDTH];\n")
     sz = 1
     for d in model.output.shape[1:]:
