@@ -38,6 +38,8 @@ from sklearn import metrics
 from .fully_connected_opt_weight_generation import *
 
 
+TF_LEAKY_RELU_DEFAULT = 0.3
+
 def is_input_layer(layer: kl.Layer):
     """
     Check if layer is an input layer
@@ -73,6 +75,26 @@ def get_input_list(model: keras.Model | kl.Layer):
     if not isinstance(inputs, list):
         inputs = [inputs]
     return inputs
+
+
+def get_io_list(model: keras.Model | kl.Layer, attr):
+    """
+    Return list of model/layer's outputs
+
+    Parameters
+    ----------
+    model : keras.Model | kl.Layer
+
+    Returns
+    -------
+    outputs : list
+        List of keras_tensors.
+
+    """
+    val_list = getattr(model, attr)
+    if not isinstance(val_list, list):
+        val_list = [val_list]
+    return val_list
 
 
 def get_int_bits(min_value: float, max_value: float):
@@ -185,6 +207,7 @@ def make_initial_shift_list(
         model_layers = [model.input] + model_layers
 
     inp_idx = 0
+    features = None
     for layer in model_layers: # layer loop
         if is_input_layer(layer):
             features = x_test[inp_idx] if isinstance(x_test, list) else x_test
@@ -378,14 +401,10 @@ def fuse_bn_to_conv(layer):
 
 def generate_weights(
         model: keras.Model, x_test: np.array=None, quantize_method="max_min",
-        max_calibrate_size=1000, fmt="hwc", verbose=False):
-    # Quantize weights to 8-bits using (min,max) and write to file
-    f = io.StringIO()
-    f.write('#include "nnom.h"\n\n')
+        max_calibrate_size=1000, fmt="hwc", verbose=False, fuse_bn=True, out_file=None):
 
-    if isinstance(x_test, type(None)):
-        shift_list = None
-    else:
+    shift_list = None
+    if not isinstance(x_test, type(None)):
         shift_list = layers_output_ranges(
             model, x_test, quantize_method=quantize_method,
             max_calibrate_size=max_calibrate_size, verbose=verbose
@@ -397,23 +416,24 @@ def generate_weights(
         if not layer.weights:
             continue
 
-        # before merging bn layer, check if the bn is "legally" after Conv
-        if (
-            "batch_normalization" in layer.name
-            and "conv" not in layer.inbound_nodes[0].inbound_layers.name
-        ):
-            raise Exception(
-                "Currently only support batch_normalization after conv",
-                layer.name, layer._inbound_nodes[0].inbound_layers[0].name
-            )
-
-        # try to fuse BN layer to convolutional
-        if (
-            "conv" in layer.name
-            and layer.outbound_nodes
-            and "batch_normalization" in layer.outbound_nodes[0].outbound_layer.name
-        ):
-            fuse_bn_to_conv(layer)
+        if fuse_bn:
+            # before merging bn layer, check if the bn is "legally" after Conv
+            if (
+                "batch_normalization" in layer.name
+                and "conv" not in layer.inbound_nodes[0].inbound_layers.name
+            ):
+                raise Exception(
+                    "Currently only support batch_normalization after conv",
+                    layer.name, layer._inbound_nodes[0].inbound_layers[0].name
+                )
+    
+            # try to fuse BN layer to convolutional
+            if (
+                "conv" in layer.name
+                and layer.outbound_nodes
+                and "batch_normalization" in layer.outbound_nodes[0].outbound_layer.name
+            ):
+                fuse_bn_to_conv(layer)
 
         # generate weights and bias now
         weight_dec_shift = 0
@@ -421,8 +441,8 @@ def generate_weights(
             print('weights for layer', layer.name)
 
         layer_quantize_info[layer.name] = {}
-        layer_weights[layer.name] = {}
-        for var in layer.weights:
+        layer_weights[layer.name] = layer.get_weights()
+        for i, var in enumerate(layer.weights):
             var_name = str(var.name)
             is_kernel = "kernel" in var_name
             if not is_kernel and "bias" not in var_name:
@@ -461,7 +481,7 @@ def generate_weights(
                 if verbose:
                     print("  new dec bit", dec_bits)
 
-            layer_quantize_info[layer.name][var_name] = {
+            layer_quantize_info[layer.name][i] = {
                 "min": min_value,
                 "max": max_value,
                 "data_width": dec_bits
@@ -469,9 +489,10 @@ def generate_weights(
 
             # convert to [-128,128) or int8
             var_values = np.round(var_values * 2 ** dec_bits)
-            layer_weights[layer.name][int(not is_kernel)] = var_values
+            layer_weights[layer.name][i] = var_values
             var_name = var_name.replace('/', '_').replace(':', '_')
-            f.write("#define " + var_name.upper() + " {")
+            if out_file:
+                out_file.write("#define " + var_name.upper() + " {")
 
             # CHW format
             if "chw" in fmt:
@@ -495,18 +516,18 @@ def generate_weights(
             if verbose:
                 print("  reshape to:", transposed_wts.shape)
 
-            f.write(np.array2string(
-                transposed_wts.flatten(),
-                separator=", ",
-                threshold=transposed_wts.size,
-                formatter={"all": lambda x: str(int(x))}
-            ).strip("[]").replace('\n', ''))
-            # transposed_wts.tofile(f, sep=", ", format="%d")
-            f.write("}\n\n")
-            f.write(f"#define {var_name.upper()}_SHIFT ({dec_bits})\n\n")
-            if not is_kernel:
-                f.write("\n")
-    return f, layer_weights, layer_quantize_info, shift_list
+            if out_file:
+                out_file.write(np.array2string(
+                    transposed_wts.flatten(),
+                    separator=", ",
+                    threshold=transposed_wts.size,
+                    formatter={"all": lambda x: str(int(x))}
+                ).strip("[]").replace('\n', ''))
+                out_file.write("}\n\n")
+                out_file.write(f"#define {var_name.upper()}_SHIFT ({dec_bits})\n\n")
+                if not is_kernel:
+                    out_file.write("\n")
+    return layer_weights, layer_quantize_info, shift_list, out_file
 
 
 def layers_output_ranges(model, x_test, quantize_method="max_min", max_calibrate_size=1000, verbose=False):
@@ -571,274 +592,379 @@ def layers_output_ranges(model, x_test, quantize_method="max_min", max_calibrate
     return shift_list
 
 
-def generate_model(
-        model, x_test, name='weights.h', fmt='hwc', quantize_method='max_min',
-        max_calibrate_size=1000, verbose=False):
-    f, *_, shift_list = generate_weights(
-        model, x_test=x_test, fmt=fmt, quantize_method=quantize_method,
-        max_calibrate_size=max_calibrate_size, verbose=verbose
+def prod(arr):
+    result = 1
+    for el in arr:
+        result *= el
+    return result
+
+
+def get_iname(layer):
+    return layer.name.replace(':', '/').split('/')[0]
+
+
+def to_cpp_var_name(layer_name):
+    return layer_name.upper().replace('/', '_').replace(':', '_')
+
+
+def is_skipable_layer(layer, fmt="hwc"):
+    # FIXME: add more that could be skiped
+    # flatten layer can be skipped in HWC but have to present in CHW
+    return (
+        "lambda" in layer.name
+        or "dropout" in layer.name
+        or "batch_normalization" in layer.name
+        or ("flatten" in layer.name and "chw" not in fmt)
     )
 
-    model_layers = model.layers
-    if not is_input_layer(model.layers[0]):
-        model_layers = [model.input] + model_layers
 
-    def get_iname(layer):
-        return layer.name.replace(':', '/').split('/')[0]
+def element_wise_merge(op_name, op_symbol):
+    func_name = f"{op_name}Merge"
+    return func_name, f"void {func_name}" + "(const int8_t* arr1, const int8_t* arr2, size_t N) { for (size_t i = 0; i < N; ++i) { " + f"arr1[i] {op_symbol}= arr2[i]" + "; } }\n"
 
-    def to_cpp_var_name(layer_name):
-        return layer_name.upper().replace('/', '_').replace(':', '_')
 
-    def is_skipable_layer(layer):
-        # FIXME: add more that could be skiped
-        # flatten layer can be skipped in HWC but have to present in CHW
-        return (
-            "lambda" in layer.name
-            or "dropout" in layer.name
-            or "batch_normalization" in layer.name
-            or ("flatten" in layer.name and "chw" not in fmt)
+def make_forward_func_str(segmented_model, ptr_dict):
+    from segmented_model import sort_connections
+    forward_str = "static void forward(nnom_model_t* models) {\n"
+    added_merge_funcs = {}
+    already_run = set()
+    for conn in sort_connections(segmented_model.connections):
+        inputs, outputs = conn
+        is_input = lambda name: any(name in inps for (inps, _) in segmented_model.connections)
+        for inp in inputs:
+            if inp in already_run:
+                continue
+            forward_str += f"\tmodel_run({ptr_dict[inp]['model']}); // {inp}\n"
+            already_run.add(inp)
+        merge_func = segmented_model.connections[conn]
+        for out in outputs:
+            # Set up input for output nodes
+            offset = ""
+            for i, inp in enumerate(inputs):
+                merge_type = None if merge_func is None else merge_func.__class__.__name__
+                if merge_type is None:
+                    forward_str += f"\tmemcpy({ptr_dict[out]['input']}, {ptr_dict[inp]['output']}, {ptr_dict[inp]['output_len']} * sizeof(int8_t));\n"
+                elif "Concatenate" in merge_type:
+                    copy_len = ptr_dict[inp]['output_len']
+                    forward_str += f"\tmemcpy({ptr_dict[out]['input']}{offset}, {ptr_dict[inp]['output']}, {copy_len} * sizeof(int8_t));\n"
+                    offset += f" + {copy_len}"
+                elif "Add" in merge_type or "Mult" in merge_type:
+                    if merge_type not in added_merge_funcs:
+                        added_merge_funcs.add(merge_type)
+                        op_name, op_symbol, base_val = ("add", '+', 0) if "Add" in merge_type else ("mult", '*', 1)
+                        func_name, func_str = element_wise_merge(op_name, op_symbol)
+                        forward_str = func_str + forward_str
+                        added_merge_funcs[merge_type] = (func_name, base_val)
+                    func_name, base_val = added_merge_funcs[merge_type]
+                    input_arr = ptr_dict[out]['input']
+                    if i == 0:
+                        forward_str += f"\tmemset({input_arr}, {base_val}, {ptr_dict[out]['input_len']} * sizeof(int8_t));\n"
+                    forward_str += "\t{func_name}({input_arr}, {ptr_dict[inp]['output']});\n"
+            if not is_input(out):
+                forward_str += f"\tmodel_run({ptr_dict[out]['model']});\n"
+    return forward_str + "}\n"
+
+
+def generate_model(
+        model, x_test=None, name='weights.h', fmt='hwc', quantize_method='max_min',
+        max_calibrate_size=1000, verbose=False):
+    from segmented_model import SegmentedModel
+    f = io.StringIO()
+    f.write('#include "nnom.h"\n\n')
+    segmented_model = SegmentedModel(model)
+    is_ensemble = len(segmented_model.nodes) > 1
+    if not is_ensemble:
+        f.write("#define forward model_run\n\n")
+    if type(x_test) is type(None):
+        x_test = segmented_model.make_input(batch_size=max_calibrate_size)
+    # populate last_inputs
+    segmented_model(x_test)
+    layer_construct_params = {}
+    model_segments = list(segmented_model.segments())
+    for node_name, model in model_segments:
+        *_, shift_list, f = generate_weights(
+            model, x_test=segmented_model.last_inputs[node_name], fmt=fmt, quantize_method=quantize_method,
+            max_calibrate_size=max_calibrate_size, verbose=verbose, out_file=f
         )
-    
-    def add_activation(layer, inp, layer_id, cfg):
-        activ_name = cfg.get("activation")
-        if activ_name in ["tanh", "sigmoid"]:
-            f.write(f"\tlayer[{layer_id}] = model.active(act_{activ_name}({inp.upper()}_OUTPUT_SHIFT), layer[{LI[inp][0]}]);\n")
-        elif "re_lu" in layer.name or activ_name in ["softmax", "relu"]:
-            func_name = "Softmax" if activ_name == "softmax" else "act_relu"
-            func_type = "hook" if activ_name == "softmax" else "active"
-            f.write(f"\tlayer[{layer_id}] = model.{func_type}({func_name}(), layer[{LI[inp][0]}]);\n")
-        elif activ_name != "linear":
-            raise Exception(f"{activ_name} activation is unsupported.")
 
-    f.write('\n/* output encoding for each layer */\n')
-    for layer in model_layers:
-        iname = get_iname(layer)
-        f.write(f"#define {iname.upper()}_OUTPUT_SHIFT {shift_list[iname]}\n")
+        model_layers = model.layers
+        if not is_input_layer(model.layers[0]):
+            model_layers = [model.input] + model_layers
 
-    f.write('\n/* bias shift and output shift for each layer */\n')
-    for layer in model_layers:
-        if not is_shift_layer(layer):
-            continue
-        iname = layer.name.upper()
-        if (
-                len(layer.weights) == 2
-                and "kernel" in layer.weights[0].name
-                and "bias" in layer.weights[1].name
-            ):
-            kernel, bias = layer.weights
-            kname = to_cpp_var_name(kernel.name)
-            bname = to_cpp_var_name(bias.name)
-            inp = get_iname(layer.input).upper()
-            f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT+{kname}_SHIFT-{iname}_OUTPUT_SHIFT)\n")
-            f.write(f"#define {iname}_BIAS_LSHIFT   ({inp}_OUTPUT_SHIFT+{kname}_SHIFT-{bname}_SHIFT)\n")
-            f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
-            f.write(f"#if {iname}_BIAS_LSHIFT < 0\n#error {iname}_BIAS_RSHIFT must be bigger than 0\n#endif\n")
-        # add, sub
-        elif "add" in layer.name or "subtract" in layer.name:
-            # only consider the first, they have been set to same in out_put_range()
-            inp = get_iname(layer.input[0]).upper()
-            f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT-{iname}_OUTPUT_SHIFT)\n")
-            f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
-        # mult is different, Q3.4 * Q3.4 = Q6.8. if mult out is Q4.3, then shift (Q.4+q.4)-Q.3=5. Am I right?
-        elif "multiply" in layer.name:
-            inp = get_iname(layer.input[0]).upper()
-            f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT*2-{iname}_OUTPUT_SHIFT)\n")
-            f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
+        f.write('\n/* output encoding for each layer */\n')
+        for layer in model_layers:
+            iname = get_iname(layer)
+            f.write(f"#define {iname.upper()}_OUTPUT_SHIFT {shift_list[iname]}\n")
 
-    ID = 0
-    LI = {}
-    f.write('\n/* weights for each layer */\n')
-    for layer_id, layer in enumerate(model_layers):
-        if is_skipable_layer(layer):
-            inp = get_iname(layer.input)
-            LI[layer.name] = (LI[inp][0], layer)
-        else:
-            layer_name = layer.name
-            if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
-                layer_name = layer.name.split(':')[0]
-            LI[layer_name] = (ID, layer)
-            ID += 1
+        f.write('\n/* bias shift and output shift for each layer */\n')
+        for layer in model_layers:
+            if not is_shift_layer(layer):
+                continue
+            iname = layer.name.upper()
+            if (
+                    len(layer.weights) == 2
+                    and "kernel" in layer.weights[0].name
+                    and "bias" in layer.weights[1].name
+                ):
+                kernel, bias = layer.weights
+                kname = to_cpp_var_name(kernel.name)
+                bname = to_cpp_var_name(bias.name)
+                inp = get_iname(layer.input).upper()
+                f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT+{kname}_SHIFT-{iname}_OUTPUT_SHIFT)\n")
+                f.write(f"#define {iname}_BIAS_LSHIFT   ({inp}_OUTPUT_SHIFT+{kname}_SHIFT-{bname}_SHIFT)\n")
+                f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
+                f.write(f"#if {iname}_BIAS_LSHIFT < 0\n#error {iname}_BIAS_RSHIFT must be bigger than 0\n#endif\n")
+            # add, sub
+            elif "add" in layer.name or "subtract" in layer.name:
+                # only consider the first, they have been set to same in out_put_range()
+                inp = get_iname(layer.input[0]).upper()
+                f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT-{iname}_OUTPUT_SHIFT)\n")
+                f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
+            # mult is different, Q3.4 * Q3.4 = Q6.8. if mult out is Q4.3, then shift (Q.4+q.4)-Q.3=5. Am I right?
+            elif "multiply" in layer.name:
+                inp = get_iname(layer.input[0]).upper()
+                f.write(f"#define {iname}_OUTPUT_RSHIFT ({inp}_OUTPUT_SHIFT*2-{iname}_OUTPUT_SHIFT)\n")
+                f.write(f"#if {iname}_OUTPUT_RSHIFT < 0\n#error {iname}_OUTPUT_RSHIFT must be bigger than 0\n#endif\n")
 
-        if is_input_layer(layer) or not layer.weights:
-            continue
-        for var in layer.weights:
-            var_name = to_cpp_var_name(var.name)
-            if "KERNEL" in var_name:
-                f.write(f"static const int8_t {layer.name}_weights[] = {var_name};\n")
-                f.write('static const nnom_weight_t %s_w = { (const void*)%s_weights, %s_OUTPUT_RSHIFT};\n' % (layer.name, layer.name, layer.name.upper()))
-            elif "BIAS" in var_name:
-                f.write(f"static const int8_t {layer.name}_bias[] = {var_name};\n")
-                f.write('static const nnom_bias_t %s_b = { (const void*)%s_bias, %s_BIAS_LSHIFT};\n' % (layer.name, layer.name, layer.name.upper()))
+        ID = 0
+        LI = {}
+        f.write('\n/* weights for each layer */\n')
+        for layer_id, layer in enumerate(model_layers):
+            if is_skipable_layer(layer):
+                inp = get_iname(layer.input)
+                LI[layer.name] = (LI[inp][0], layer)
+            else:
+                layer_name = layer.name
+                if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
+                    layer_name = layer.name.split(':')[0]
+                LI[layer_name] = (ID, layer)
+                ID += 1
+
+            if is_input_layer(layer) or not layer.weights:
+                continue
+            for var in layer.weights:
+                var_name = to_cpp_var_name(var.name)
+                if "KERNEL" in var_name:
+                    f.write(f"static const int8_t {layer.name}_weights[] = {var_name};\n")
+                    f.write('static const nnom_weight_t %s_w = { (const void*)%s_weights, %s_OUTPUT_RSHIFT};\n' % (layer.name, layer.name, layer.name.upper()))
+                elif "BIAS" in var_name:
+                    f.write(f"static const int8_t {layer.name}_bias[] = {var_name};\n")
+                    f.write('static const nnom_bias_t %s_b = { (const void*)%s_bias, %s_BIAS_LSHIFT};\n' % (layer.name, layer.name, layer.name.upper()))
+        layer_construct_params[node_name] = (ID, LI)
+        if name:
+            save_root, _ = os.path.split(name)
+            with open(os.path.join(save_root, f"{node_name}.shift_list"), 'w') as shift_file:
+                shift_file.write(str(shift_list))
 
     f.write("\n/* nnom model */\n")
     # FIXME: now only support one output
-    inp_sizes = []
-    max_idx = 0
-    inp_list = get_input_list(model)
-    for i, inp in enumerate(inp_list):
-        sz = 1
-        for d in inp.shape[1:]:
-            sz *= d
-        inp_sizes.append(sz)
-        if inp_sizes[i] > inp_sizes[max_idx]:
-            max_idx = i
-    f.write(f"const int8_t NUM_INPUTS = {len(inp_sizes)};\n")
-    f.write(f"const int{'8_t' if sz < 128 else ''} INPUT_LENGTHS[] = ")
-    f.write('{' + str(inp_sizes)[1:-1] + "};\n")
-    f.write(f"const int8_t IN_DATA_WIDTH = {inp_sizes[max_idx]};\n")
-    f.write(f"static int8_t nnom_input_data[NUM_INPUTS][IN_DATA_WIDTH];\n")
-    sz = 1
-    for d in model.output.shape[1:]:
-        sz *= d
-    f.write(f"const int{'8_t' if sz < 128 else ''} OUTPUT_LENGTH = {sz};\n")
-    f.write("static int8_t nnom_output_data[OUTPUT_LENGTH];\n")
+    for io_name in ["input", "output"]:
+        io_sizes = []
+        max_idx = 0
+        io_list = sum([get_io_list(model, io_name) for _, model in model_segments], [])
+        for i, inp in enumerate(io_list):
+            sz = 1
+            for d in inp.shape[1:]:
+                sz *= d
+            io_sizes.append(sz)
+            if io_sizes[i] > io_sizes[max_idx]:
+                max_idx = i
+        f.write(f"const int8_t NUM_{io_name.upper()}S = {len(io_sizes)};\n")
+        f.write(f"const int8_t ALL_{io_name.upper()}S_SIZE = {sum(io_sizes)};\n")
+        f.write(f"const int{'8_t' if sz < 128 else ''} {io_name.upper()}_LENGTHS[] = ")
+        f.write('{' + str(io_sizes)[1:-1] + "};\n")
+        f.write(f"static int8_t nnom_{io_name}_data[ALL_{io_name.upper()}S_SIZE];\n")
+        for i in range(len(io_sizes)):
+            ptr = f"nnom_{io_name}_data" if i == 0 else f"nnom_{io_name}_{i} + {io_name.upper()}_LENGTHS[{i - 1}]"
+            f.write(f"static int8_t* nnom_{io_name}_{i + 1} = {ptr};\n")
+        if io_name == "output":
+            f.write(f"static int8_t* send_data = nnom_{io_name}_{i + 1};\n")
+            f.write(f"static int8_t SEND_LENGTH = OUTPUT_LENGTHS[{i}];\n")
     f.write("static nnom_model_t* nnom_model_create(void)\n{\n")
-    f.write("\tstatic nnom_model_t model;\n")
+    model_idx = f"s[{len(segmented_model.nodes)}]" if is_ensemble else ""
+    f.write(f"\tstatic nnom_model_t model{model_idx};")
+    ptr_dict = {}
+    for i, (node_name, model) in enumerate(model_segments):
+        ID, LI = layer_construct_params[node_name]
+        model_layers = model.layers
 
-    if ID > 32:
-        f.write(f"\tnnom_layer_t ** layer = malloc(sizeof(nnom_layer_t *)*{ID + 1});\n")
-        f.write("\tif(NULL == layer) return NULL;\n")
-    else:
-        f.write(f"\tnnom_layer_t* layer[{ID + 1}];\n")
-
-    f.write("\n\tnew_model(&model);\n\n")
-    inp_idx = 0
-    for layer in model_layers:
-        if is_skipable_layer(layer):
-            continue
-        #FIXME: need a better solution to seperate the input 'tensor' from other layers
-        if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
-            layer_id, _ = LI[layer.name.split(':')[0]]
+        model_obj = f"models[{i}]" if is_ensemble else "model"
+        layer_arr_name = f"layers_{i + 1}" if is_ensemble else "layer"
+        model_ptr = f"models{' + ' + str(i) if i else ''}" if is_ensemble else "&model"
+        input_ptr = f"nnom_input_{i + 1}"
+        output_ptr = f"nnom_output_{i + 1}"
+        ptr_dict[node_name] = {
+            "model": model_ptr,
+            "input": input_ptr,
+            "output": output_ptr,
+            "input_len": f"INPUT_LENGTHS[{i}]",
+            "output_len": f"OUTPUT_LENGTHS[{i}]"
+        }
+        
+        f.write("\n")
+        if ID > 32:
+            f.write(f"\tnnom_layer_t** {layer_arr_name} = (nnom_layer_t**) malloc(sizeof(nnom_layer_t*) * {ID + 1});\n")
+            f.write("\tif(NULL == {layer_arr_name}) return NULL;\n")
         else:
-            layer_id, _ = LI[layer.name]
-        try:
-            inp = get_iname(getattr(layer, "input", None))
-        except AttributeError:
-            inp = ""
-        cfg = getattr(layer, "get_config", lambda: None)()
+            f.write(f"\tnnom_layer_t* {layer_arr_name}[{ID + 1}];\n")
 
-        if "input" in layer.name:
+        f.write(f"\n\tnew_model({model_ptr});\n")
+        for layer in model_layers:
+            if is_skipable_layer(layer):
+                continue
+            #FIXME: need a better solution to seperate the input 'tensor' from other layers
+            if isinstance(model.input, tf.Tensor) and not is_input_layer(model.layers[0]):
+                layer_id, _ = LI[layer.name.split(':')[0]]
+            else:
+                layer_id, _ = LI[layer.name]
             try:
-                inshape = layer.input_shape[0][1:] # new changes in tf2?
-            except:
-                inshape = layer.shape[1:]
-            if len(inshape) == 1:  # 1-D input
-                f.write(f"\tlayer[{layer_id}] = Input(shape({inshape[0]}, 1, 1), nnom_input_data[{inp_idx}]);\n")
-            elif len(inshape) == 2:  # 1-D input
-                f.write(f"\tlayer[{layer_id}] = Input(shape(1, {inshape[0]}, {inshape[1]}), nnom_input_data[{inp_idx}]);\n")
-            else:
-                f.write(f"\tlayer[{layer_id}] = Input(shape{inshape}, nnom_input_data[{inp_idx}]);\n")
-            inp_idx += 1
+                inp = get_iname(getattr(layer, "input", None))
+            except AttributeError:
+                inp = ""
+            cfg = getattr(layer, "get_config", lambda: None)()
 
-        # convolutional
-        elif "conv" in layer.name:
-            is_depthwise = "depthwise" in layer.name
-            num_filters = 1 if is_depthwise else cfg["filters"]
-            conv_type = "Conv2D"
-            if is_depthwise:
-                conv_type = "DW_" + conv_type
-
-            # Expand kernel, stride, and dilation for 1D conv
-            kernel, stride, dilation = pad_filter_sizes(
-                cfg['kernel_size'], cfg['strides'], cfg['dilation_rate']
-            )
-            f.write(
-                f"\tlayer[{layer_id}] = model.hook("
-                + f"{conv_type}({num_filters}, kernel{kernel}, "
-                + f"stride{stride}, dilation{dilation}, "
-                + f"PADDING_{cfg['padding']}, &{layer.name}_w, "
-                + f"&{layer.name}_b), layer[{LI[inp][0]}]);\n"
-            )
-
-        # activations
-        elif "activation" in layer.name or "re_lu" in layer.name:
-            add_activation(layer, inp, layer_id, cfg)
-
-        # pooling
-        elif "pooling" in layer.name:
-            pooling_type = "Avg" if "average" in layer.name else layer.name[:3].capitalize()
-            if "global" in layer.name:
-                # a global avg pool before softmax can be replace by sumpool in MCU (recommend)
-                if pooling_type == "Avg" and layer == model.layers[-2] and "Softmax" in model.layers[-1].output.name:
-                    if verbose:
-                        print(layer.name, 'has been replaced by GlobalSumPool()')
-                    f.write(f"\tlayer[{layer_id}] = model.hook(GlobalSumPool(), layer[{LI[inp][0]}]);\n")
+            if "input" in layer.name:
+                try:
+                    inshape = layer.input_shape[0][1:] # new changes in tf2?
+                except:
+                    inshape = layer.shape[1:]
+                if len(inshape) == 1:  # 1-D input
+                    f.write(f"\t{layer_arr_name}[{layer_id}] = Input(shape({inshape[0]}, 1, 1), {input_ptr});\n")
+                elif len(inshape) == 2:  # 1-D input
+                    f.write(f"\t{layer_arr_name}[{layer_id}] = Input(shape(1, {inshape[0]}, {inshape[1]}), {input_ptr});\n")
                 else:
-                    f.write(f"\tlayer[{layer_id}] = model.hook(Global{pooling_type}Pool(), layer[{LI[inp][0]}]);\n")
-            else:
-                # Expand 1D Pooling params
-                pool_size, strides = pad_filter_sizes(cfg["pool_size"], cfg["strides"])
+                    f.write(f"\t{layer_arr_name}[{layer_id}] = Input(shape{inshape}, {input_ptr});\n")
+
+            # convolutional
+            elif "conv" in layer.name:
+                is_depthwise = "depthwise" in layer.name
+                num_filters = 1 if is_depthwise else cfg["filters"]
+                conv_type = "Conv2D"
+                if is_depthwise:
+                    conv_type = "DW_" + conv_type
+
+                # Expand kernel, stride, and dilation for 1D conv
+                kernel, stride, dilation = pad_filter_sizes(
+                    cfg['kernel_size'], cfg['strides'], cfg['dilation_rate']
+                )
                 padding = cfg["padding"].upper()
                 f.write(
-                    f"\tlayer[{layer_id}] = model.hook("
-                    + f"{pooling_type}Pool("
-                    + f"kernel{pool_size}, stride{strides}, PADDING_{padding}"
-                    + f"), layer[{LI[inp][0]}]);\n"
+                    f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook("
+                    + f"{conv_type}({num_filters}, kernel{kernel}, "
+                    + f"stride{stride}, dilation{dilation}, "
+                    + f"PADDING_{padding}, &{layer.name}_w, "
+                    + f"&{layer.name}_b), {layer_arr_name}[{LI[inp][0]}]);\n"
                 )
-        elif "up_sampling" in layer.name:
-            size = pad_filter_sizes(cfg["size"])[0]
-            f.write(f"\tlayer[{layer_id}] = model.hook(UpSample(kernel{size}), layer[{LI[inp][0]}]);\n")
 
-        # Zero padding / Cropping
-        elif "zero_padding" in layer.name or "cropping" in layer.name:
-            is_padding = "zero_padding" in layer.name
-            config_var = "padding" if is_padding else "cropping"
-            func_name = "ZeroPadding" if is_padding else "Cropping"
-            border_size = pad_filter_sizes(flatten(cfg[config_var]), pad_val=0, shape=4)[0]
-            f.write(f"\tlayer[{layer_id}] = model.hook({func_name}(border{border_size}), layer[{LI[inp][0]}]);\n")
+            # activations
+            elif "activation" in layer.name or "re_lu" in layer.name:
+                prev_id = LI[inp][0]
+                activ_name = cfg.get("activation")
+                if activ_name in ["tanh", "sigmoid"]:
+                    f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.active(act_{activ_name}({inp.upper()}_OUTPUT_SHIFT), {layer_arr_name}[{prev_id}]);\n")
+                elif "re_lu" in layer.name or activ_name in ["softmax", "relu", "leaky_relu"]:
+                    func_name = "Softmax"
+                    if activ_name != "softmax": # Parse relu func name
+                        base_func_name = (layer.name if "re_lu" in layer.name else activ_name).replace("re_lu", "relu")
+                        func_name = "act_" + base_func_name[:base_func_name.index("relu") + len("relu")]
+                    func_arg = cfg.get("alpha", TF_LEAKY_RELU_DEFAULT) if "leaky_relu" in func_name else ""
+                    func_type = "hook" if activ_name == "softmax" else "active"
+                    f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.{func_type}({func_name}({func_arg}), {layer_arr_name}[{prev_id}]);\n")
+                elif activ_name != "linear":
+                    raise Exception(f"{activ_name} activation is unsupported.")
 
-        # Flatten
-        elif "flatten" in layer.name: # flatten is needed in CHW backend but not needed in HWC
-            f.write(f"\tlayer[{layer_id}] = model.hook(Flatten(), layer[{LI[inp][0]}]);\n")
+            # pooling
+            elif "pooling" in layer.name:
+                pooling_type = "Avg" if "average" in layer.name else layer.name[:3].capitalize()
+                if "global" in layer.name:
+                    # a global avg pool before softmax can be replace by sumpool in MCU (recommend)
+                    if pooling_type == "Avg" and layer == model.layers[-2] and "Softmax" in model.layers[-1].output.name:
+                        if verbose:
+                            print(layer.name, 'has been replaced by GlobalSumPool()')
+                        f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook(GlobalSumPool(), {layer_arr_name}[{LI[inp][0]}]);\n")
+                    else:
+                        f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook(Global{pooling_type}Pool(), {layer_arr_name}[{LI[inp][0]}]);\n")
+                else:
+                    # Expand 1D Pooling params
+                    pool_size, strides = pad_filter_sizes(cfg["pool_size"], cfg["strides"])
+                    padding = cfg["padding"].upper()
+                    f.write(
+                        f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook("
+                        + f"{pooling_type}Pool("
+                        + f"kernel{pool_size}, stride{strides}, PADDING_{padding}"
+                        + f"), {layer_arr_name}[{LI[inp][0]}]);\n"
+                    )
+            elif "up_sampling" in layer.name:
+                size = pad_filter_sizes(cfg["size"])[0]
+                f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook(UpSample(kernel{size}), {layer_arr_name}[{LI[inp][0]}]);\n")
 
-        # Multi-input layers
-        elif any(merge_name in layer.name for merge_name in ["concatenate", "add", "subtract", "multiply"]):
-            inps = [get_iname(input) for input in layer.input]
-            inX = ", ".join([f"layer[{LI[inp][0]}]" for inp in inps])
-            if "concatenate" in layer.name:
-                f.write(f"\tlayer[{layer_id}] = model.mergex(Concat({cfg['axis']}), {len(inps)}, {inX});\n")
-            else:
-                func_name = "Mult" if "multiply" in layer.name else layer.name[:3].capitalize()
-                if func_name == "Mult":
-                    warnings.warn("Warning mutiply is under testing")
+            # Zero padding / Cropping
+            elif "zero_padding" in layer.name or "cropping" in layer.name:
+                is_padding = "zero_padding" in layer.name
+                config_var = "padding" if is_padding else "cropping"
+                func_name = "ZeroPadding" if is_padding else "Cropping"
+                border_size = pad_filter_sizes(flatten(cfg[config_var]), pad_val=0, shape=4)[0]
+                f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook({func_name}(border{border_size}), {layer_arr_name}[{LI[inp][0]}]);\n")
+
+            # Flatten
+            elif "flatten" in layer.name: # flatten is needed in CHW backend but not needed in HWC
+                f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook(Flatten(), {layer_arr_name}[{LI[inp][0]}]);\n")
+
+            # Multi-input layers
+            elif any(merge_name in layer.name for merge_name in ["concatenate", "add", "subtract", "multiply"]):
+                inps = [get_iname(input) for input in layer.input]
+                inX = ", ".join([f"{layer_arr_name}[{LI[inp][0]}]" for inp in inps])
+                if "concatenate" in layer.name:
+                    f.write(f"\t{layer_arr_name}[{layer_id}] = {model_obj}.mergex(Concat({cfg['axis']}), {len(inps)}, {inX});\n")
+                else:
+                    func_name = "Mult" if "multiply" in layer.name else layer.name[:3].capitalize()
+                    if func_name == "Mult":
+                        warnings.warn("Warning mutiply is under testing")
+                    f.write(
+                        f"\t{layer_arr_name}[{layer_id}] = {model_obj}.mergex("
+                        + f"{func_name}({layer.name.upper()}_OUTPUT_RSHIFT), {len(inps)}{inX});\n"
+                    )
+
+            # Dense
+            elif "dense" in layer.name:
                 f.write(
-                    f"\tlayer[{layer_id}] = model.mergex("
-                    + f"{func_name}({layer.name.upper()}_OUTPUT_RSHIFT), {len(inps)}{inX});\n"
+                    f"\t{layer_arr_name}[{layer_id}] = {model_obj}.hook("
+                    + f"Dense({cfg['units']}, &{layer.name}_w, &{layer.name}_b), {layer_arr_name}[{LI[inp][0]}]);\n"
                 )
 
-        # Dense
-        elif "dense" in layer.name:
-            f.write(
-                f"\tlayer[{layer_id}] = model.hook("
-                + f"Dense({cfg['units']}, &{layer.name}_w, &{layer.name}_b), layer[{LI[inp][0]}]);\n"
-            )
+            else:
+                raise Exception("unsupported layer", layer.name, layer)
 
+        # FIXME, test later.
+        if (
+            "softmax" in layer.name
+            or len(layer.output.shape) == 2
+            or ("activation" in layer.name and layer.get_config()["activation"] == "softmax")
+        ):
+            out_shape = (layer.output.shape[1], 1, 1)
+        elif len(layer.output.shape) == 4:
+            out_shape = layer.output.shape[1:]
+        elif len(layer.output.shape) == 3:
+            out_shape = (1, layer.output.shape[1], layer.output.shape[2])
         else:
-            raise Exception("unsupported layer", layer.name, layer)
+            raise Exception("unsupported output shape of the last layer", layer.name, layer)
+        f.write(f"\t{layer_arr_name}[{layer_id + 1}] = {model_obj}.hook(Output(shape{out_shape}, {output_ptr}), {layer_arr_name}[{layer_id}]);\n")
+        f.write(f"\tmodel_compile({model_ptr}, {layer_arr_name}[0], {layer_arr_name}[{layer_id + 1}]);\n")
+        if ID > 32:
+            f.write("\tfree(layer);\n")
+    return_ptr = "models" if is_ensemble else "&model"
+    f.write(f"\treturn {return_ptr};" + "\n}\n")
 
-    # FIXME, test later.
-    if (
-        "softmax" in layer.name
-        or len(layer.output.shape) == 2
-        or ("activation" in layer.name and layer.get_config()["activation"] == "softmax")
-    ):
-        out_shape = (layer.output.shape[1], 1, 1)
-    elif len(layer.output.shape) == 4:
-        out_shape = layer.output.shape[1:]
-    elif len(layer.output.shape) == 3:
-        out_shape = (1, layer.output.shape[1], layer.output.shape[2])
-    else:
-        raise Exception("unsupported output shape of the last layer", layer.name, layer)
-    f.write(f"\tlayer[{layer_id + 1}] = model.hook(Output(shape{out_shape}, nnom_output_data), layer[{layer_id}]);\n")
-    f.write(f"\tmodel_compile(&model, layer[0], layer[{layer_id + 1}]);\n")
-    if ID > 32:
-        f.write("\tfree(layer);\n")
-    f.write("\treturn &model;\n}\n")
-    save_root, _ = os.path.split(name)
-    with open(os.path.join(save_root, ".shift_list"), 'w') as file:
-        file.write(str(shift_list))
+    # Make forward function
+    if is_ensemble:
+        f.write('\n' + make_forward_func_str(segmented_model, ptr_dict))
+
+    # Save to files
+    if not name:
+        return f.getvalue()
     with open(name, 'w+', encoding="utf-8") as file:
         file.write(f.getvalue())
+    return name
 
 
 def evaluate_model(model, x_test, y_test, running_time=False, to_file='evaluation.txt'):

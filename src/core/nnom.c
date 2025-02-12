@@ -592,7 +592,7 @@ static void print_memory_block_info(nnom_mem_block_t *block_pool)
 // 	1) if the layer has multiple input but not all of them are filled by last layers. returns NN_MORE_TODO
 //	2) if all the output hooked are nested called. return NN_SUCCESS
 //	3) if the layer is output layer. return NN_SUCCESS
-nnom_status_t compile_layers(nnom_layer_t* first, nnom_layer_t *curr, nnom_mem_block_t *block_pool, uint32_t *layer_count, int8_t depth)
+nnom_status_t compile_layers(nnom_layer_t* first, nnom_layer_t *curr, nnom_mem_block_t *block_pool, uint32_t *layer_count)
 {
 	size_t mem_size = 0;
 	nnom_layer_t *layer = curr;
@@ -613,7 +613,6 @@ nnom_status_t compile_layers(nnom_layer_t* first, nnom_layer_t *curr, nnom_mem_b
 
 	while (layer)
 	{
-		NNOM_LOG("layer->super.type: %s\n", NNOMTYPES[(int) layer->type]);
 		// check input
 		in = layer->in;
 
@@ -649,21 +648,10 @@ nnom_status_t compile_layers(nnom_layer_t* first, nnom_layer_t *curr, nnom_mem_b
 		{
 			while (in != NULL)
 			{
-				// Found another branch, stemming from alternate input
-				if (in->mem == NULL && in->hook.io != NULL && depth == 0) {
-					hook = &in->hook;
-					// Find input layer of the untraversed branch
-					while (hook->io->owner->in != NULL && hook->io->owner->in->hook.io != NULL) {
-						hook = &hook->io->owner->in->hook;
-					}
-					// Return result of compiling layers on other input branch
-					return compile_layers(first, hook->io->owner, block_pool, layer_count, depth + 1);
-				}
 				// if the mem (of its hooked output) is not allocated or is not filled. 
 				// It not the time to run the layer yet, return and waits for next nested called. 
-				else if (in->mem == NULL || in->mem->state != NNOM_BUF_FILLED) {
+				if (in->mem == NULL || in->mem->state != NNOM_BUF_FILLED)
 					return NN_MORE_TODO;
-				}
 				in = in->aux;
 			}
 		}
@@ -799,7 +787,7 @@ nnom_status_t compile_layers(nnom_layer_t* first, nnom_layer_t *curr, nnom_mem_b
 				hook = &out->hook;
 				while (hook != NULL && hook->io != NULL)
 				{
-					compile_layers(first, hook->io->owner, block_pool, layer_count, depth + 1);
+					compile_layers(first, hook->io->owner, block_pool, layer_count);
 					hook = hook->next;
 				}
 
@@ -965,7 +953,7 @@ nnom_status_t model_compile(nnom_model_t *m, nnom_layer_t *input, nnom_layer_t *
 	NNOM_LOG("-------------------------------------------------------------------------------------------------\n");
 
 	// compile layers, started from list head, nested run till the end of models
-	NNOM_LOG("compile_layers success: %d\n", compile_layers(m->head, m->head, m->blocks, &layer_num, 0));
+	compile_layers(m->head, m->head, m->blocks, &layer_num);
 
 	NNOM_LOG("-------------------------------------------------------------------------------------------------\n");
 
@@ -1118,5 +1106,6 @@ nnom_status_t check_model_version(unsigned long model_version)
 	}
 	return result;
 }
+
 
 
